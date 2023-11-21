@@ -1,6 +1,7 @@
 ## Import libraries ##
 import os
 import csv
+import statistics
 from tqdm import tqdm
 from collections import Counter
 import SimpleITK as sitk
@@ -40,14 +41,22 @@ def get_quantities(data_path):
                 patient_IDs[ID] += 1
     return patient_IDs
 
+def get_median(alist):
+    median_list = list()
+    for l in range(len(alist)):
+        m = statistics.median(alist[l])
+        median_list.append(m)
+    return median_list
+
+
+
+
 if __name__ == "__main__":
-    ## Data path ##
-    # Change if needed
-    script_path = os.getcwd()
-    data_path = os.path.join(script_path, "data", "Segmentation_data", "raw", "Task402_BLT_MRI", "imagesTr")
-    out_filename = "./data/Images_info.csv"
-    # data_path = "C:/Users/Yin/Desktop/Vrije_courses/internship/codes/data/elastix-test-data/resample/"
-    # out_filename = "C:/Users/Yin/Desktop/Vrije_courses/internship/codes/data/elastix-test-data/resample/Images_shape.csv"
+    #################
+    ### Data path ###  # Change if needed #
+    #################
+    data_path = "../data/Segmentation_data/raw/Task402_BLT_MRI/imagesTr"
+    out_filename = "../data/Images_info.csv"
     print(f"Data path: {data_path}")
 
     ## Get a list of all the patient IDs and their amount of modalities ##
@@ -74,6 +83,8 @@ if __name__ == "__main__":
     
     
     ## Iterate over each patient and write the file ##
+    all_spacing = [[], [], []]
+    all_shape = [[], [], []]
     for ID in tqdm(patient_IDs):
         ## check the shape ##
         shape_list = [f"BLT_{ID}"]
@@ -87,8 +98,18 @@ if __name__ == "__main__":
             shape = img.GetSize()
             spacing = img.GetSpacing()
             
+            # get the shape and spacing in the list
             shape_list.append(shape)
             spacing_list.append(spacing)
+            
+            # store the info for furthur median calculating
+            all_shape[0].append(shape[0])
+            all_shape[1].append(shape[1])
+            all_shape[2].append(shape[2])
+            all_spacing[0].append(spacing[0])
+            all_spacing[1].append(spacing[1])
+            all_spacing[2].append(spacing[2])
+            
         # check if all the image shapes are the same
         shape_list.append("1") if chkList(shape_list, with_title=True) else shape_list.append("0")
         spacing_list.append("1") if chkList(spacing_list) else spacing_list.append("0")
@@ -102,4 +123,13 @@ if __name__ == "__main__":
             writer = csv.writer(file)
             info = shape_list + spacing_list
             writer.writerow(info)
+    
+    median_shape = get_median(all_shape)
+    median_spacing = get_median(all_spacing)
+    with open(out_filename, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        info = ["median shape: ", median_shape, "median spacing: ", median_spacing]
+        writer.writerow(info)
+    
+    print(f"Median shape:\t{median_shape}\nMedian spacing:\t{median_spacing}")
             
