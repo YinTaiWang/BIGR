@@ -4,7 +4,24 @@ import csv
 import statistics
 from tqdm import tqdm
 from collections import Counter
+import argparse
 import SimpleITK as sitk
+
+def parse_args():
+    """
+        Parses inputs from the commandline.
+        :return: inputs as a Namespace object
+    """
+    parser = argparse.ArgumentParser(description="Write a csv file for checking the shapes and spacing of the images")
+    parser.add_argument("-i", "--image_files_path", help="a path of where the images. This arguments is required!",
+                        required=True)
+    parser.add_argument("-o", "--output_path", help="a path of where to save the file. This arguments is required!",
+                        required=True)
+    parser.add_argument("-n", "--output_filename", help="output .csv file name. If it's not specified, then used the default name.", 
+                        required=False)
+
+    return parser.parse_args()
+
 
 ## Functions ##
 def chkList(info_list, with_title=False):
@@ -49,16 +66,21 @@ def get_median(alist):
     return median_list
 
 
-
-
-if __name__ == "__main__":
-    #################
-    ### Data path ###  # Change if needed #
-    #################
-    data_path = "../data/Segmentation_data/raw/Task402_BLT_MRI/imagesTr"
-    out_filename = "../data/Images_info.csv"
-    print(f"Data path: {data_path}")
-
+def main():
+    # Process arguments
+    args = parse_args()
+    data_path = args.image_files_path
+    out_path = args.output_path
+    out_filename = args.output_filename
+    if out_filename is None:
+        out_filename = "images_info.csv"
+    elif ".csv" not in out_filename:
+        out_filename = out_filename + ".csv"
+    
+    out_file = os.path.join(out_path, out_filename)
+    print(f"Data: {data_path}")
+    print(f"Output: {out_file}")
+    
     ## Get a list of all the patient IDs and their amount of modalities ##
     patient_IDs = get_quantities(data_path)
     
@@ -77,7 +99,7 @@ if __name__ == "__main__":
     columns.append("spacing equivalent")
     columns.append("Most common spacing")
     # write the CSV file
-    with open(out_filename, mode='w', newline='') as file:
+    with open(out_file, mode='w', newline='') as file:
         writer = csv.writer(file)
         writer.writerow(columns)
     
@@ -119,17 +141,21 @@ if __name__ == "__main__":
         shape_list.append(most_common_shape)
         spacing_list.append(most_common_sapcing)
         # write the CSV file
-        with open(out_filename, mode='a', newline='') as file:
+        with open(out_file, mode='a', newline='') as file:
             writer = csv.writer(file)
             info = shape_list + spacing_list
             writer.writerow(info)
     
     median_shape = get_median(all_shape)
     median_spacing = get_median(all_spacing)
-    with open(out_filename, mode='a', newline='') as file:
+    with open(out_file, mode='a', newline='') as file:
         writer = csv.writer(file)
         info = ["median shape: ", median_shape, "median spacing: ", median_spacing]
         writer.writerow(info)
     
     print(f"Median shape:\t{median_shape}\nMedian spacing:\t{median_spacing}")
-            
+    
+
+    
+if __name__ == "__main__":
+    main()
