@@ -58,15 +58,27 @@ def get_quantities(data_path):
                 patient_IDs[ID] += 1
     return patient_IDs
 
-def get_median(alist):
-    median_list = list()
-    for l in range(len(alist)):
-        m = statistics.median(alist[l])
-        median_list.append(m)
-    return median_list
+def get_stat(alist, stat:str):
+    stat_list = list()
+    if stat == "max":
+        for l in range(len(alist)):
+            m = max(alist[l])
+            stat_list.append(m)
+    elif stat == "median":
+        for l in range(len(alist)):
+            m = statistics.median(alist[l])
+            stat_list.append(m)
+    elif stat == "min":
+        for l in range(len(alist)):
+            m = min(alist[l])
+            stat_list.append(m)    
+    return stat_list
 
 
 def main():
+    stat = input("Need statistic info (Y/N)? ")
+    q_shape_stat = input("For shape (max/median/min): ")
+    q_spacing_stat = input("For spacing (max/median/min): ")
     # Process arguments
     args = parse_args()
     data_path = args.image_files_path
@@ -146,16 +158,12 @@ def main():
             info = shape_list + spacing_list
             writer.writerow(info)
     
-    median_shape = get_median(all_shape)
-    median_spacing = get_median(all_spacing)
-    with open(out_file, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        info = ["median shape: ", median_shape, "median spacing: ", median_spacing]
-        writer.writerow(info)
-    
-    print(f"Median shape:\t{median_shape}\nMedian spacing:\t{median_spacing}")
-    
-
+    if stat == "Y" or stat == "y":
+        shape_stat = get_stat(all_shape, stat=q_shape_stat)
+        spacing_stat = get_stat(all_spacing, stat=q_spacing_stat)
+        print(f"Max shape:\t{shape_stat}\nMedian spacing:\t{spacing_stat}")
+    else:
+        pass
     
 if __name__ == "__main__":
     main()
