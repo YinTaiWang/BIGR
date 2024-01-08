@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument("-i", "--image_files_path", help="a path of where the images. This arguments is required!",
                         required=True)
     parser.add_argument("-o", "--output_path", help="a path of where to save the file. This arguments is required!",
-                        required=True)
+                        required=False)
     parser.add_argument("-n", "--output_filename", help="output .csv file name. If it's not specified, then used the default name.", 
                         required=False)
 
@@ -76,13 +76,16 @@ def get_stat(alist, stat:str):
 
 
 def main():
-    stat = input("Need statistic info (Y/N)? ")
-    q_shape_stat = input("For shape (max/median/min): ")
-    q_spacing_stat = input("For spacing (max/median/min): ")
+    stat = input("Need statistic info (Y/N)? ").lower()
+    if stat == "y":
+        q_shape_stat = input("For shape (max/median/min): ").lower()
+        q_spacing_stat = input("For spacing (max/median/min): ").lower()
     # Process arguments
     args = parse_args()
     data_path = args.image_files_path
     out_path = args.output_path
+    if out_path is None:
+        out_path = os.getcwd()
     out_filename = args.output_filename
     if out_filename is None:
         out_filename = "images_info.csv"
@@ -158,7 +161,7 @@ def main():
             info = shape_list + spacing_list
             writer.writerow(info)
     
-    if stat == "Y" or stat == "y":
+    if stat == "y":
         shape_stat = get_stat(all_shape, stat=q_shape_stat)
         spacing_stat = get_stat(all_spacing, stat=q_spacing_stat)
         print(f"Max shape:\t{shape_stat}\nMedian spacing:\t{spacing_stat}")
