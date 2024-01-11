@@ -12,7 +12,7 @@ import seaborn as sns
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, recall_score
 from sklearn.model_selection import StratifiedShuffleSplit
 
 import itk
@@ -66,7 +66,17 @@ class EMA:
             if param.requires_grad:
                 param.data = self.backup[name]
 
+####################
+### Functions
 def check_dataoverlap(train_x, val_x, test_x):
+    '''
+    Args:
+        train_x: a list of training data
+        val_x: a list of validation data
+        test_x: a list of testing data
+    Return:
+        print if the data has overlapping elements.
+    '''
     # Check dataoverlap
     overlap = set(train_x) & set(val_x) & set(test_x)
 
@@ -76,18 +86,69 @@ def check_dataoverlap(train_x, val_x, test_x):
     else:
         print("The data have no overlapping elements.")
         
+def create_empty_predict_lists(device):
+    y = torch.tensor([], dtype=torch.long, device=device)
+    y_pred = torch.tensor([], dtype=torch.float32, device=device)
+    y_true_values = list()
+    y_pred_values = list()
+    return y, y_pred, y_true_values, y_pred_values
+
+def calaulate_auc(y, y_pred, y_trans, y_pred_trans):
+    '''
+    Args:
+        y: a tensor containing true labels
+        y_pred: a tensor containing prdicted values without argmax
+        y_trans: transformation setting for y
+        y_pred_trans: transformation setting for y_pred
+    Return:
+        a float of auc value
+    '''
+    auc_metric = ROCAUCMetric()
+    y_onehot = [y_trans(i) for i in decollate_batch(y, detach=False)]
+    y_pred_act = [y_pred_trans(i) for i in decollate_batch(y_pred)]
+    auc_metric(y_pred_act, y_onehot)
+    auc_value = auc_metric.aggregate()
+    auc_metric.reset()
+    del y_pred_act, y_onehot
+    return auc_value
+
+def calaulate_metric(y:list, y_pred:list):
+    '''
+    Args:
+        y: a list contatin true labels
+        y_pred: a list containing prdicted values after argmax
+    Return:
+        metric: a tuple containing 4 values of TP, FP, FN, TN
+        avg_sensitivity: average sensitivity value
+        avg_specificity: average specificity value
+    '''
+    cm = confusion_matrix(y, y_pred)
+    TP = np.diag(cm)
+    FP = np.sum(cm, axis=0) - TP
+    FN = np.sum(cm, axis=1) - TP
+    TN = np.sum(cm) - (FP + FN + TP)
+    # Calculate Sensitivity(Recall) and Specificity for each class
+    sensitivity = TP / (TP + FN)
+    avg_sensitivity = sum(sensitivity)/len(sensitivity)
+    specificity = TN / (TN + FP)
+    avg_specificity = sum(specificity)/len(specificity)
+    return (TP, FP, FN, TN), avg_sensitivity, avg_specificity
+        
 
 def main():
+    ####################
+    ### Setup
     monai.config.print_config()
     logging.basicConfig(stream=sys.stdout, level=logging.INFO)
     
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     attempt = datetime.now().strftime("%Y-%j-%M")
     set_determinism(seed=0)
 
     ####################
-    ## set path
+    ### Set path, change if needed
     script_dir = os.getcwd()
-    model_dir = os.path.join(script_dir, "data", "BLT_radiomics", "models")
+    model_dir = os.path.join(script_dir, "data", "BLT_radiomics", "models", "densenet")
     img4D_dir = "/data/scratch/r098906/BLT_radiomics/4D_new_registered/images"
     seg4D_dir = "/data/scratch/r098906/BLT_radiomics/4D_new_registered/segs"
     # data_dir = os.path.join(script_dir, "data", "BLT_radiomics", "image_files")
@@ -95,7 +156,7 @@ def main():
     # seg4D_dir = os.path.join(script_dir, "data", "BLT_radiomics", "4D_old_registered", "segs")
 
     ####################
-    ## Load files
+    ### Load the data
     # image files
     images = []
     for file in os.listdir(img4D_dir):
@@ -116,8 +177,6 @@ def main():
     labels = torch.from_numpy(labels)
     num_class = len(np.unique(labels, axis=0))
 
-    # print(images)
-    # print(segs)
     print(f"image data count: {len(images)}.\nsegmetation data count: {len(segs)}.\nnumber of class: {num_class}.")
 
     ####################
@@ -174,33 +233,36 @@ def main():
     # print(type(im), im.shape, seg.shape, label)
 
     # create a data loader
+    batch_size = 1
     train_ds = ImageDataset(image_files=train_x, seg_files=train_seg, labels=train_y,
                             transform=train_transforms, seg_transform=train_transforms)
-    train_loader = DataLoader(train_ds, batch_size=15, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
 
     # create a validation data loader
     val_ds = ImageDataset(image_files=val_x, seg_files=val_seg, labels=val_y, 
                         transform=val_transforms, seg_transform=val_transforms)
-    val_loader = DataLoader(val_ds, batch_size=25, num_workers=2, pin_memory=torch.cuda.is_available())
+    val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=2, pin_memory=torch.cuda.is_available())
 
     # create a test data loader
     test_ds = ImageDataset(image_files=test_x, seg_files=test_seg, labels=test_y, 
                         transform=val_transforms, seg_transform=val_transforms)
-    test_loader = DataLoader(test_ds, batch_size=25, num_workers=2, pin_memory=torch.cuda.is_available())
+    test_loader = DataLoader(test_ds, batch_size=batch_size, num_workers=2, pin_memory=torch.cuda.is_available())
     
     ####################
-    ## Create the model
-    # Create DenseNet121, CrossEntropyLoss and Adam optimizer
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = monai.networks.nets.DenseNet121(spatial_dims=3, in_channels=5, out_channels=num_class).to(device)
+    ## Create the model, loss function and optimizer
+    model = monai.networks.nets.DenseNet121(spatial_dims=3, in_channels=5, out_channels=num_class, norm='instance').to(device)
     loss_function = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
     auc_metric = ROCAUCMetric()
     ema = EMA(model)
 
     ####################
-    ## Training
+    ## Training & validation
     # settings
+    save_model = os.path.join(model_dir, attempt+".pth")
+    if os.path.exists(save_model):
+        raise ValueError("The model already exists")
+
     max_epochs = 100
     val_interval = 1
     best_metric = -1
@@ -208,34 +270,41 @@ def main():
     writer = SummaryWriter()
 
     # store the data
-    history = {
-        "epoch_loss_values": [],
-        "tr_AUC_values": [],
-        "ts_AUC_values": [],
-        "ts_ACC_values": [],
-        "lrs": []
-    }
+    train_history = {
+        "epoch_loss": [],
+        "AUC": [],
+        "metric": [],
+        "sensitivity": [],
+        "specificity": []}
+
+    val_history = {
+        "AUC": [],
+        "metric": [],
+        "sensitivity": [],
+        "specificity": []}
 
     for epoch in range(max_epochs):
         print("-" * 15)
         print(f"epoch {epoch + 1}/{max_epochs}")
+        print("#"*3+" Training")
         model.train()
+        
         epoch_loss = 0
         step = 0
+        y, y_pred, y_true_values, y_pred_values = create_empty_predict_lists(device)
+
         for batch_data in train_loader:
             step += 1
-            y = torch.tensor([], dtype=torch.long, device=device)
-            y_pred = torch.tensor([], dtype=torch.float32, device=device)
-            
             train_images, train_segs, train_labels = (
                 batch_data[0].to(device), 
                 batch_data[1].to(device), 
                 batch_data[2].to(device))
-            masked_train_images = torch.cat((train_images,train_segs[:,1:2,:,:]), dim=1) 
+            masked_train_images = torch.cat((train_images,train_segs[:,0:1,:,:]), dim=1) 
             
+            # forward and backward pass
             optimizer.zero_grad()
-            # print(f"current lr: {optimizer.param_groups[0]['lr']}")
             train_pred = model(masked_train_images)
+            train_pred_argmax = train_pred.argmax(dim=1)
             loss = loss_function(train_pred, train_labels)
             loss.backward()
             optimizer.step()
@@ -248,175 +317,185 @@ def main():
             print(f"{step}/{epoch_len}, train_loss: {loss.item():.4f}")
             writer.add_scalar("train_loss", loss.item(), epoch_len * epoch + step)
             
-        # Calculate train AUC
+            # append the predicted value
             y = torch.cat([y, train_labels], dim=0)
             y_pred = torch.cat([y_pred, train_pred], dim=0)
-        y_onehot = [y_trans(i) for i in decollate_batch(y, detach=False)]
-        y_pred_act = [y_pred_trans(i) for i in decollate_batch(y_pred)]
-        auc_metric(y_pred_act, y_onehot)
-        auc_value = auc_metric.aggregate()
-        auc_metric.reset()
-        del y_pred_act, y_onehot
-        history["tr_AUC_values"].append(auc_value)
+            y_true_values.append(train_labels)
+            y_pred_values.append(train_pred_argmax)
+        
+        auc_value = calaulate_auc(y, y_pred, y_trans, y_pred_trans)
+        metric, avg_sensitivity, avg_specificity = calaulate_metric(y_true_values, y_pred_values)
+        train_history["AUC"].append(auc_value)
+        train_history["metric"].append(metric)
+        train_history["sensitivity"].append(avg_sensitivity)
+        train_history["specificity"].append(avg_specificity)
         
         epoch_loss /= step
-        history["epoch_loss_values"].append(epoch_loss)
+        train_history["epoch_loss"].append(epoch_loss)
         print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
         
         if (epoch + 1) % val_interval == 0:
-            print("-"*3+"Validate"+"-"*3)
+            print("#"*3+" Validation")
             ema.apply_shadow()
             model.eval()
             
-            num_correct = 0.0
-            metric_count = 0
+            y_val, y_val_pred, y_val_true_values, y_val_pred_values = create_empty_predict_lists(device)
             
             with torch.no_grad():
                 for val_data in val_loader:
-                    y_val = torch.tensor([], dtype=torch.long, device=device)
-                    y_val_pred = torch.tensor([], dtype=torch.float32, device=device)
-                    
                     val_images, val_segs, val_labels = (
                         val_data[0].to(device),
                         val_data[1].to(device),
                         val_data[2].to(device))
-                    masked_val_images = torch.cat((val_images,val_segs[:,1:2,:,:]), dim=1) # use mask
+                    masked_val_images = torch.cat((val_images,val_segs[:,0:1,:,:]), dim=1)
                     
                     val_pred = model(masked_val_images)
-                    val_argmax = val_pred.argmax(dim=1)
-                    val_acc = torch.eq(val_argmax, val_labels)
-                    metric_count += len(val_acc)
-                    num_correct += val_acc.sum().item()
-                    
-                # Calculate AUC
+                    val_pred_argmax = val_pred.argmax(dim=1)
+
+                    # append value to the lists
                     y_val = torch.cat([y_val, val_labels], dim=0)
                     y_val_pred = torch.cat([y_val_pred, val_pred], dim=0)
-                y_val_onehot = [y_trans(i) for i in decollate_batch(y_val, detach=False)]
-                y_val_pred_act = [y_pred_trans(i) for i in decollate_batch(y_val_pred)]
-                auc_metric(y_val_pred_act, y_val_onehot)
-                val_auc_value = auc_metric.aggregate()
-                auc_metric.reset()
-                del y_val_pred_act, y_val_onehot
-                history["ts_AUC_values"].append(val_auc_value)
+                    y_val_true_values.append(val_labels)
+                    y_val_pred_values.append(val_pred_argmax)
                 
-                # Calculate Accuracy
-                val_acc_value = num_correct / metric_count
-                history["ts_ACC_values"].append(val_acc_value)
+                val_auc_value = calaulate_auc(y_val, y_val_pred, y_trans, y_pred_trans)
+                val_metric, val_avg_sensitivity, val_avg_specificity = calaulate_metric(y_val_true_values, y_val_pred_values)
+                val_history["AUC"].append(val_auc_value)
+                val_history["metric"].append(val_metric)
+                val_history["sensitivity"].append(val_avg_sensitivity)
+                val_history["specificity"].append(val_avg_specificity) 
                 
                 if val_auc_value > best_metric:
                     best_metric = val_auc_value
                     best_metric_epoch = epoch + 1
-                    save_model = os.path.join(model_dir, attempt+"_new.pth")
                     torch.save(model.state_dict(), save_model)
-                    print("saved new best metric model")
-                print(f"Current epoch: {epoch+1}")
-                print(f"AUC: {val_auc_value:.4f}; Accuracy: {val_acc_value:.4f}")
+                    print(f"Save new best metric model: {attempt}_new.pth")
+                print(f"Current epoch: {epoch+1}, AUC: {val_auc_value:.4f}")
+                print(f"Sensitivity: {val_avg_sensitivity:.4f}, Specificity: {val_avg_specificity:.4f}")
                 print(f"Best AUC: {best_metric:.4f} at epoch {best_metric_epoch}")
                 writer.add_scalar("val_AUC", val_auc_value, epoch + 1)
                 ema.restore()
         
     print(f"train completed, best_metric: {best_metric:.4f} " f"at epoch: {best_metric_epoch}")
     writer.close()
-        
-    print(f"train completed, best_metric: {best_metric:.4f} " f"at epoch: {best_metric_epoch}")
-    writer.close()
+    
+    ####################
+    ## Plotting the loss and training history
+    # settings
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    x = [i + 1 for i in range(len(train_history["epoch_loss"]))]
+    y = train_history["epoch_loss"]
+    axes[0,0].plot(x, y)
+    axes[0,0].set_title("Epoch Average Loss")
+    axes[0,0].set_xlabel("epoch")
 
-    plt.figure("train", (25, 6))
-    plt.subplot(1, 3, 1)
-    plt.title("Epoch Average Loss")
-    x = [i + 1 for i in range(len(history["epoch_loss_values"]))]
-    y = history["epoch_loss_values"]
-    plt.xlabel("epoch")
-    plt.plot(x, y)
+    x = [val_interval * (i + 1) for i in range(len(train_history["AUC"]))]
+    y1 = train_history["AUC"]
+    y2 = val_history["AUC"]
+    axes[0,1].plot(x, y1, label="training")
+    axes[0,1].plot(x, y2, label="validation")
+    axes[0,1].legend()
+    axes[0,1].set_title("AUC")
+    axes[0,1].set_xlabel("epoch")
+    axes[0,1].set_ylim(bottom=0);
 
-    plt.subplot(1, 3, 2)
-    plt.title("Val AUC")
-    x = [val_interval * (i + 1) for i in range(len(history["tr_AUC_values"]))]
-    y1 = history["tr_AUC_values"]
-    y2 = history["ts_AUC_values"]
-    plt.xlabel("epoch")
-    plt.plot(x, y1, label="training")
-    plt.plot(x, y2, label="validation")
-    plt.legend()
+    x = [val_interval * (i + 1) for i in range(len(train_history["sensitivity"]))]
+    y1 = train_history["sensitivity"]
+    y2 = val_history["sensitivity"]
+    axes[1,0].plot(x, y1, label="training")
+    axes[1,0].plot(x, y2, label="validation")
+    axes[1,0].legend()
+    axes[1,0].set_title("Sensitivity")
+    axes[1,0].set_xlabel("epoch")
+    axes[1,0].set_ylim(bottom=0);
 
-    plt.subplot(1, 3, 3)
-    plt.title("Val accuracy")
-    x = [val_interval * (i + 1) for i in range(len(history["ts_ACC_values"]))]
-    y = history["ts_ACC_values"]
-    plt.xlabel("epoch")
-    plt.plot(x, y)
-    save_dir = os.path.join(model_dir, "snap", attempt+"_new_snap.png")
+    x = [val_interval * (i + 1) for i in range(len(train_history["specificity"]))]
+    y1 = train_history["specificity"]
+    y2 = val_history["specificity"]
+    axes[1,1].plot(x, y1, label="training")
+    axes[1,1].plot(x, y2, label="validation")
+    axes[1,1].legend()
+    axes[1,1].set_title("Specificity")
+    axes[1,1].set_xlabel("epoch")
+    axes[1,1].set_ylim(bottom=0);
+
+    save_dir = os.path.join(model_dir, "snap", attempt + "_snap.png")
     plt.savefig(save_dir)
-    plt.show()
     
+    # # Calculate mean and standard deviation for both training and test AUC
+    # mean_ts = np.mean(history["ts_AUC_values"])
+    # std_ts = np.std(history["ts_AUC_values"])
+    # mean_tr = np.mean(history["tr_AUC_values"])
+    # std_tr = np.std(history["tr_AUC_values"])
+
+    # # Create an array of x values
+    # x = range(len(history["ts_AUC_values"]))
+
+    # # Plot test AUC values
+    # plt.plot(x, history["ts_AUC_values"], label='Test AUC', color='#06592A')
+    # plt.fill_between(x, history["ts_AUC_values"] - std_ts, history["ts_AUC_values"] + std_ts, color='#06592A', alpha=0.2, label='Test Mean ± Std Dev')
+
+    # # Plot training AUC values
+    # plt.plot(x, history["tr_AUC_values"], label='Train AUC', color='#1F77B4')
+    # plt.fill_between(x, history["tr_AUC_values"] - std_tr, history["tr_AUC_values"] + std_tr, color='#1F77B4', alpha=0.2, label='Train Mean ± Std Dev')
     
-    # Calculate mean and standard deviation for both training and test AUC
-    mean_ts = np.mean(history["ts_AUC_values"])
-    std_ts = np.std(history["ts_AUC_values"])
-    mean_tr = np.mean(history["tr_AUC_values"])
-    std_tr = np.std(history["tr_AUC_values"])
-
-    # Create an array of x values
-    x = range(len(history["ts_AUC_values"]))
-
-    # Plot test AUC values
-    plt.plot(x, history["ts_AUC_values"], label='Test AUC', color='#06592A')
-    plt.fill_between(x, history["ts_AUC_values"] - std_ts, history["ts_AUC_values"] + std_ts, color='#06592A', alpha=0.2, label='Test Mean ± Std Dev')
-
-    # Plot training AUC values
-    plt.plot(x, history["tr_AUC_values"], label='Train AUC', color='#1F77B4')
-    plt.fill_between(x, history["tr_AUC_values"] - std_tr, history["tr_AUC_values"] + std_tr, color='#1F77B4', alpha=0.2, label='Train Mean ± Std Dev')
-    
-    plt.axhline(y=0.5, color='black', linestyle='--', lw=0.8, label='Random')
-    plt.xlim(0, len(history["ts_AUC_values"]))
-    plt.ylim(bottom=0)
-    plt.title('Training and Validation AUC')
-    plt.legend()
-    save_dir = os.path.join(model_dir, "snap", attempt + "_new_AUC_snap.png")
-    plt.savefig(save_dir)
-    plt.show()
+    # plt.axhline(y=0.5, color='black', linestyle='--', lw=0.8, label='Random')
+    # plt.xlim(0, len(history["ts_AUC_values"]))
+    # plt.ylim(bottom=0)
+    # plt.title('Training and Validation AUC')
+    # plt.legend()
+    # save_dir = os.path.join(model_dir, "snap", attempt + "_new_AUC_snap.png")
+    # plt.savefig(save_dir)
+    # plt.show()
     
     ####################
     ## Testing
-    model.load_state_dict(torch.load(os.path.join(model_dir, attempt+"_new.pth"), map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
+    model.load_state_dict(torch.load(os.path.join(model_dir, attempt+".pth"), map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
     ema.apply_shadow()
+    model.eval()
+
+    y_ts, y_ts_pred, y_ts_true_values, y_ts_pred_values = create_empty_predict_lists(device)
+
     with torch.no_grad():
-        model.eval()
-        y_ts_true_values = []
-        y_ts_pred_values = []
-        
         for test_data in test_loader:
-            y_ts_pred = torch.tensor([], dtype=torch.float32, device=device)
-            y_ts = torch.tensor([], dtype=torch.long, device=device)
             test_images, test_segs, test_labels = (
                 test_data[0].to(device),
                 test_data[1].to(device),
                 test_data[2].to(device))
+            masked_test_images = torch.cat((test_images,test_segs[:,0:1,:,:]), dim=1)
             
-            masked_test_images = torch.cat((test_images,test_segs[:,1:2,:,:]), dim=1)
             ts_pred = model(masked_test_images)
             ts_pred_argmax = ts_pred.argmax(dim=1)
             
-            for i in range(len(ts_pred_argmax)):
-                y_ts_true_values.append(test_labels[i].item())
-                y_ts_pred_values.append(ts_pred_argmax[i].item())
-                
-            y_ts_pred = torch.cat([y_ts_pred, ts_pred], dim=0)
+            # append the value to the list
             y_ts = torch.cat([y_ts, test_labels], dim=0)
-            
-        y_ts_onehot = [y_trans(i) for i in decollate_batch(y_ts, detach=False)]
-        y_ts_pred_act = [y_pred_trans(i) for i in decollate_batch(y_ts_pred)]
-        auc_metric(y_ts_pred_act, y_ts_onehot)
-        ts_auc_value = auc_metric.aggregate()
-        print(f"Test AUC: {ts_auc_value}")
+            y_ts_pred = torch.cat([y_ts_pred, ts_pred], dim=0)
+            y_ts_true_values.append(test_labels)
+            y_ts_pred_values.append(ts_pred_argmax)
+        
+        ts_auc_value = calaulate_auc(y_ts, y_ts_pred, y_trans, y_pred_trans)
+        ts_metric, ts_avg_sensitivity, ts_avg_specificity = calaulate_metric(y_ts_true_values, y_ts_pred_values)
+        print(f"Model evaluate on testing set; AUC: {ts_auc_value}")
+        print(f"Sensitivity: {ts_avg_sensitivity:4f}, Specificity: {ts_avg_specificity:4f}")
        
     ####################
     ## Results       
+    TP, FP, FN, TN = ts_metric
+    results = np.vstack((TP, FP, FN, TN)).T
+    results_df = pd.DataFrame(results, columns=["TP", "FP", "FN", "TN"])
+    results_df.index = ["HCA","FNH","HCC"]
+    Recall = TP / (TP + FN)
+    Specificity = TN / (TN + FP)
+
+    # Adding these metrics to the DataFrame
+    results_df["Recall"] = Recall
+    results_df["Specificity"] = Specificity
+    print(results_df)
+    
     print(classification_report(y_ts_true_values, y_ts_pred_values, target_names=["HCA","FNH","HCC"], digits=3))
     
     # Creating  a confusion matrix,which compares the y_test and y_pred
     cm = confusion_matrix(y_ts_true_values, y_ts_pred_values)
-    #Plotting the confusion matrix
     plt.figure(figsize=(5,4))
     sns.heatmap(cm, annot=True)
     plt.title('Confusion Matrix')
