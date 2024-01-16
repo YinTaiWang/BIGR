@@ -12,8 +12,18 @@ import seaborn as sns
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import classification_report, confusion_matrix, recall_score
+from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import StratifiedShuffleSplit
+
+import itk
+import SimpleITK as sitk
+import monai
+from monai.data import ImageDataset, DataLoader, decollate_batch
+from monai.metrics import ROCAUCMetric
+from monai.utils import set_determinism
+from monai.transforms import (
+    EnsureChannelFirst, Compose, Activations, AsDiscrete,
+    Resize, RandRotate, RandFlip, RandZoom, RandGaussianNoise,ToTensor)
 
 import itk
 import SimpleITK as sitk
@@ -89,9 +99,8 @@ def check_dataoverlap(train_x, val_x, test_x):
 def create_empty_predict_lists(device):
     y = torch.tensor([], dtype=torch.long, device=device)
     y_pred = torch.tensor([], dtype=torch.float32, device=device)
-    y_true_values = list()
-    y_pred_values = list()
-    return y, y_pred, y_true_values, y_pred_values
+    y_pred_argmax = torch.tensor([], dtype=torch.long, device=device)
+    return y, y_pred, y_pred_argmax
 
 def calaulate_auc(y, y_pred, y_trans, y_pred_trans):
     '''
@@ -112,16 +121,22 @@ def calaulate_auc(y, y_pred, y_trans, y_pred_trans):
     del y_pred_act, y_onehot
     return auc_value
 
-def calaulate_metric(y:list, y_pred:list):
+def calaulate_metric(y, y_pred):
     '''
     Args:
-        y: a list contatin true labels
-        y_pred: a list containing prdicted values after argmax
+        y: a tensor contating true labels
+        y_pred: a tensor containing prdicted values after argmax
     Return:
         metric: a tuple containing 4 values of TP, FP, FN, TN
         avg_sensitivity: average sensitivity value
         avg_specificity: average specificity value
     '''
+    # Move tensors to CPU if they are on GPU
+    if y.is_cuda:
+        y = y.cpu()
+    if y_pred.is_cuda:
+        y_pred = y_pred.cpu()
+        
     cm = confusion_matrix(y, y_pred)
     TP = np.diag(cm)
     FP = np.sum(cm, axis=0) - TP
@@ -253,7 +268,6 @@ def main():
     model = monai.networks.nets.DenseNet121(spatial_dims=3, in_channels=5, out_channels=num_class, norm='instance').to(device)
     loss_function = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
-    auc_metric = ROCAUCMetric()
     ema = EMA(model)
 
     ####################
@@ -291,7 +305,7 @@ def main():
         
         epoch_loss = 0
         step = 0
-        y, y_pred, y_true_values, y_pred_values = create_empty_predict_lists(device)
+        y, y_pred, y_pred_argmax = create_empty_predict_lists(device)
 
         for batch_data in train_loader:
             step += 1
@@ -320,11 +334,10 @@ def main():
             # append the predicted value
             y = torch.cat([y, train_labels], dim=0)
             y_pred = torch.cat([y_pred, train_pred], dim=0)
-            y_true_values.append(train_labels)
-            y_pred_values.append(train_pred_argmax)
+            y_pred_argmax = torch.cat([y_pred_argmax, train_pred_argmax], dim=0)
         
         auc_value = calaulate_auc(y, y_pred, y_trans, y_pred_trans)
-        metric, avg_sensitivity, avg_specificity = calaulate_metric(y_true_values, y_pred_values)
+        metric, avg_sensitivity, avg_specificity = calaulate_metric(y, y_pred_argmax)
         train_history["AUC"].append(auc_value)
         train_history["metric"].append(metric)
         train_history["sensitivity"].append(avg_sensitivity)
@@ -339,7 +352,7 @@ def main():
             ema.apply_shadow()
             model.eval()
             
-            y_val, y_val_pred, y_val_true_values, y_val_pred_values = create_empty_predict_lists(device)
+            y_val, y_val_pred, y_val_pred_argmax = create_empty_predict_lists(device)
             
             with torch.no_grad():
                 for val_data in val_loader:
@@ -355,11 +368,10 @@ def main():
                     # append value to the lists
                     y_val = torch.cat([y_val, val_labels], dim=0)
                     y_val_pred = torch.cat([y_val_pred, val_pred], dim=0)
-                    y_val_true_values.append(val_labels)
-                    y_val_pred_values.append(val_pred_argmax)
+                    y_val_pred_argmax = torch.cat([y_val_pred_argmax, val_pred_argmax], dim=0)
                 
                 val_auc_value = calaulate_auc(y_val, y_val_pred, y_trans, y_pred_trans)
-                val_metric, val_avg_sensitivity, val_avg_specificity = calaulate_metric(y_val_true_values, y_val_pred_values)
+                val_metric, val_avg_sensitivity, val_avg_specificity = calaulate_metric(y_val, y_val_pred_argmax)
                 val_history["AUC"].append(val_auc_value)
                 val_history["metric"].append(val_metric)
                 val_history["sensitivity"].append(val_avg_sensitivity)
@@ -369,7 +381,7 @@ def main():
                     best_metric = val_auc_value
                     best_metric_epoch = epoch + 1
                     torch.save(model.state_dict(), save_model)
-                    print(f"Save new best metric model: {attempt}_new.pth")
+                    print(f"Save new best metric model: {attempt}.pth")
                 print(f"Current epoch: {epoch+1}, AUC: {val_auc_value:.4f}")
                 print(f"Sensitivity: {val_avg_sensitivity:.4f}, Specificity: {val_avg_specificity:.4f}")
                 print(f"Best AUC: {best_metric:.4f} at epoch {best_metric_epoch}")
@@ -454,7 +466,7 @@ def main():
     ema.apply_shadow()
     model.eval()
 
-    y_ts, y_ts_pred, y_ts_true_values, y_ts_pred_values = create_empty_predict_lists(device)
+    y_ts, y_ts_pred, y_ts_pred_argmax = create_empty_predict_lists(device)
 
     with torch.no_grad():
         for test_data in test_loader:
@@ -467,14 +479,13 @@ def main():
             ts_pred = model(masked_test_images)
             ts_pred_argmax = ts_pred.argmax(dim=1)
             
-            # append the value to the list
+            # append the value
             y_ts = torch.cat([y_ts, test_labels], dim=0)
             y_ts_pred = torch.cat([y_ts_pred, ts_pred], dim=0)
-            y_ts_true_values.append(test_labels)
-            y_ts_pred_values.append(ts_pred_argmax)
+            y_ts_pred_argmax = torch.cat([y_ts_pred_argmax, ts_pred_argmax], dim=0)
         
         ts_auc_value = calaulate_auc(y_ts, y_ts_pred, y_trans, y_pred_trans)
-        ts_metric, ts_avg_sensitivity, ts_avg_specificity = calaulate_metric(y_ts_true_values, y_ts_pred_values)
+        ts_metric, ts_avg_sensitivity, ts_avg_specificity = calaulate_metric(y_ts, y_ts_pred_argmax)
         print(f"Model evaluate on testing set; AUC: {ts_auc_value}")
         print(f"Sensitivity: {ts_avg_sensitivity:4f}, Specificity: {ts_avg_specificity:4f}")
        
@@ -490,12 +501,20 @@ def main():
     # Adding these metrics to the DataFrame
     results_df["Recall"] = Recall
     results_df["Specificity"] = Specificity
+    print("\n## metric")
     print(results_df)
     
-    print(classification_report(y_ts_true_values, y_ts_pred_values, target_names=["HCA","FNH","HCC"], digits=3))
+    
+    if y_ts.is_cuda:
+        y_ts = y_ts.cpu()
+    if y_ts_pred_argmax.is_cuda:
+        y_ts_pred_argmax = y_ts_pred_argmax.cpu()
+        
+    print("\n## classification report")
+    print(classification_report(y_ts, y_ts_pred_argmax, target_names=["HCA","FNH","HCC"], digits=3))
     
     # Creating  a confusion matrix,which compares the y_test and y_pred
-    cm = confusion_matrix(y_ts_true_values, y_ts_pred_values)
+    cm = confusion_matrix(y_ts, y_ts_pred_argmax)
     plt.figure(figsize=(5,4))
     sns.heatmap(cm, annot=True)
     plt.title('Confusion Matrix')
@@ -503,7 +522,7 @@ def main():
     plt.xlabel('Predicted Values')
     save_dir = os.path.join(model_dir, "snap", attempt+"_confusion.png")
     plt.savefig(save_dir)
-    plt.show()
+    # plt.show()
 
 if __name__ == "__main__":
     main()
