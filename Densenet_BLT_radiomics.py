@@ -1,83 +1,29 @@
 import os
 import sys
-import glob
+import csv
 import logging
-from tqdm import tqdm
 from datetime import datetime
-from collections import Counter
+import torch
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+
 import seaborn as sns
-import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, roc_curve, auc
 from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.preprocessing import label_binarize
 
-import itk
-import SimpleITK as sitk
 import monai
-from monai.data import ImageDataset, DataLoader, decollate_batch
-from monai.metrics import ROCAUCMetric
+from monai.data import ImageDataset, DataLoader
 from monai.utils import set_determinism
 from monai.transforms import (
     EnsureChannelFirst, Compose, Activations, AsDiscrete,
     Resize, RandRotate, RandFlip, RandZoom, RandGaussianNoise,ToTensor)
-
-import itk
-import SimpleITK as sitk
-import monai
-from monai.data import ImageDataset, DataLoader, decollate_batch
-from monai.metrics import ROCAUCMetric
-from monai.utils import set_determinism
-from monai.transforms import (
-    EnsureChannelFirst, Compose, Activations, AsDiscrete,
-    Resize, RandRotate, RandFlip, RandZoom, RandGaussianNoise,ToTensor)
-
-class EMA:
-    def __init__(self, model):
-        self.model = model
-        self.decay = 1 / 10
-        self.shadow = {} # follow the updates of the model parameters
-        self.backup = {} # store the original model parameters
-        self.num_updates = 0
-
-        # Initialize shadow weights and backup weights with the model's initial parameters
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-                self.backup[name] = param.data.clone()
-
-    def update(self):
-        # Update the number of updates
-        self.num_updates += 1
-
-        # Calculate the decay rate based on the current number of updates
-        decay = (1 + self.num_updates) / (10 + self.num_updates)
-
-        # Update the shadow weights
-        with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                if param.requires_grad:
-                    new_average = (1.0 - decay) * param.data + decay * self.shadow[name]
-                    self.shadow[name] = new_average
-
-    def apply_shadow(self):
-        # Apply the shadow weights to the model
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data
-                param.data = self.shadow[name]
-
-    def restore(self):
-        # Restore the original model parameters
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                param.data = self.backup[name]
+from ema_pytorch import EMA
 
 ####################
-### Functions
+###  Functions   ###
+####################
 def check_dataoverlap(train_x, val_x, test_x):
     '''
     Args:
@@ -87,14 +33,27 @@ def check_dataoverlap(train_x, val_x, test_x):
     Return:
         print if the data has overlapping elements.
     '''
-    # Check dataoverlap
-    overlap = set(train_x) & set(val_x) & set(test_x)
-
-    # Check if there is any overlap
-    if overlap:
-        print(f"The following elements are overlapped: {overlap}")
+    train_patients = list()
+    val_patients = list()
+    test_patients = list()
+    
+    for i in train_x:
+        train_patients.append(int(i.split('.')[0].split("_")[-1]))
+    for i in val_x:
+        val_patients.append(int(i.split('.')[0].split("_")[-1]))
+    for i in test_x:
+        test_patients.append(int(i.split('.')[0].split("_")[-1]))
+    
+    overlapped = False
+    numbers = list()
+    for number in train_patients:
+        if number in val_patients or number in test_patients:
+            numbers.append(number)
+            overlapped = True
+    if overlapped:
+        print(f"Overlapped number found: {numbers}")
     else:
-        print("The data have no overlapping elements.")
+        print("No overlapped numbers found.")
         
 def create_empty_predict_lists(device):
     y = torch.tensor([], dtype=torch.long, device=device)
@@ -102,57 +61,415 @@ def create_empty_predict_lists(device):
     y_pred_argmax = torch.tensor([], dtype=torch.long, device=device)
     return y, y_pred, y_pred_argmax
 
-def calaulate_auc(y, y_pred, y_trans, y_pred_trans):
+def empty_history_dict():
+    history_dict = {
+    "epoch_loss": [],
+    "Accuracy": [],
+    "Sensitivity": [],
+    "Specificity": [],
+    "Precision": [],
+    "NPV": [],
+    "F1_score": [],
+    "AUC": [],
+    "AverageAccuracy": [],
+    "metric": []
+    }
+    return history_dict
+
+####################
+## Metrics
+def pairwise_auc(y_truth, y_score, class_i, class_j):
+    # Filter out the probabilities for class_i and class_j
+    y_score = [est[class_i] for ref, est in zip(y_truth, y_score) if ref in (class_i, class_j)]
+    y_truth = [ref for ref in y_truth if ref in (class_i, class_j)]
+
+    # Sort the y_truth by the estimated probabilities
+    sorted_y_truth = [y for x, y in sorted(zip(y_score, y_truth), key=lambda p: p[0])]
+
+    # Calculated the sum of ranks for class_i
+    sum_rank = 0
+    for index, element in enumerate(sorted_y_truth):
+        if element == class_i:
+            sum_rank += index + 1
+    sum_rank = float(sum_rank)
+
+    # Get the counts for class_i and class_j
+    n_class_i = float(y_truth.count(class_i))
+    n_class_j = float(y_truth.count(class_j))
+
+    # If a class in empty, AUC is 0.0
+    if n_class_i == 0 or n_class_j == 0:
+        return 0.0
+
+    # Calculate the pairwise AUC
+    return (sum_rank - (0.5 * n_class_i * (n_class_i + 1))) / (n_class_i * n_class_j)
+
+def multi_class_auc(y_truth, y_score):
+    classes = np.unique(y_truth)
+
+    # if any(t == 0.0 for t in np.sum(y_score, axis=1)):
+    #     raise ValueError('No AUC is calculated, output probabilities are missing')
+
+    pairwise_auc_list = [0.5 * (pairwise_auc(y_truth, y_score, i, j) +
+                                pairwise_auc(y_truth, y_score, j, i)) for i in classes for j in classes if i < j]
+
+    c = len(classes)
+    return (2.0 * sum(pairwise_auc_list)) / (c * (c - 1))
+
+def performance_multiclass(y_truth, y_prediction, y_score=None, beta=1):
+    '''
+    Multiclass performance metrics.
+
+    y_truth and y_prediction should both be lists or tensors with the multiclass label of each object, e.g.
+
+    y_truth = [0, 0, 0,	0, 0, 0, 2, 2, 1, 1, 2]         ### Groundtruth
+    y_prediction = [0, 0, 0, 0, 0, 0, 1, 2, 1, 2, 2]    ### Predicted labels
+    y_score = [[0.3, 0.3, 0.4], [0.2, 0.6, 0.2], ... ]  ### Normalized score per patient for all labels (three in this example)
+        
+    Calculation of accuracy accorading to formula suggested in CAD Dementia Grand Challege http://caddementia.grand-challenge.org
+    and the TADPOLE challenge https://tadpole.grand-challenge.org/Performance_Metrics/
+    Calculation of Multi Class AUC according to classpy: https://bitbucket.org/bigr_erasmusmc/classpy/src/master/classpy/multi_class_auc.py
+
+    '''
+    if y_truth.is_cuda:
+        y_truth = y_truth.cpu()
+    if y_prediction.is_cuda:
+        y_prediction = y_prediction.cpu()
+    
+    cm = confusion_matrix(y_truth, y_prediction)
+
+    # Determine no. of classes
+    labels_class = np.unique(y_truth)
+    n_class = len(labels_class)
+
+    # Splits confusion matrix in true and false positives and negatives
+    TP = np.zeros(shape=(1, n_class), dtype=int)
+    FN = np.zeros(shape=(1, n_class), dtype=int)
+    FP = np.zeros(shape=(1, n_class), dtype=int)
+    TN = np.zeros(shape=(1, n_class), dtype=int)
+    n = np.zeros(shape=(1, n_class), dtype=int)
+    for i in range(n_class):
+        TP[:, i] = cm[i, i]
+        FN[:, i] = np.sum(cm[i, :])-cm[i, i]
+        FP[:, i] = np.sum(cm[:, i])-cm[i, i]
+        TN[:, i] = np.sum(cm[:])-TP[:, i]-FP[:, i]-FN[:, i]
+
+    n = np.sum(cm)
+
+    # Determine Accuracy
+    Accuracy = (np.sum(TP))/n
+
+    # BCA: Balanced Class Accuracy
+    BCA = list()
+    for i in range(n_class):
+        BCAi = 1/2*(TP[:, i]/(TP[:, i] + FN[:, i]) + TN[:, i]/(TN[:, i] + FP[:, i]))
+        BCA.append(BCAi)
+    AverageAccuracy = np.mean(BCA)
+
+    # Determine total positives and negatives
+    P = TP + FN
+    N = FP + TN
+
+    # Calculation of sensitivity
+    Sensitivity = TP/P
+    Sensitivity = np.mean(Sensitivity)
+
+    # Calculation of specifitity
+    Specificity = TN/N
+    Specificity = np.mean(Specificity)
+
+    # Calculation of precision
+    Precision = TP/(TP+FP)
+    Precision = np.nan_to_num(Precision)
+    Precision = np.mean(Precision)
+
+    # Calculation of NPV
+    NPV = TN/(TN+FN)
+    NPV = np.nan_to_num(NPV)
+    NPV = np.mean(NPV)
+
+    # Calculation  of F1_Score
+    F1_score = ((1+(beta**2))*(Sensitivity*Precision))/((beta**2)*(Precision + Sensitivity))
+    F1_score = np.nan_to_num(F1_score)
+    F1_score = np.mean(F1_score)
+
+    # Calculation of Multi Class AUC according to classpy: https://bitbucket.org/bigr_erasmusmc/classpy/src/master/classpy/multi_class_auc.py
+    if y_score is not None:
+        if y_score.is_cuda:
+            y_score = y_score.cpu()
+        softmax = torch.nn.Softmax(dim=1)
+        y_score_soft = softmax(y_score)
+        AUC = multi_class_auc(y_truth, y_score_soft)
+    else:
+        AUC = None
+
+    return Accuracy, Sensitivity, Specificity, Precision, NPV, F1_score, AUC, AverageAccuracy, (TP, FP, FN, TN)
+
+####################
+## Save data
+def append_metrics(dictionary, Accuracy, Sensitivity, Specificity, Precision, NPV, F1_score, AUC, AverageAccuracy, metric):
+    dictionary["Accuracy"].append(Accuracy)
+    dictionary["Sensitivity"].append(Sensitivity)
+    dictionary["Specificity"].append(Specificity)
+    dictionary["Precision"].append(Precision)
+    dictionary["NPV"].append(NPV)
+    dictionary["F1_score"].append(F1_score)
+    dictionary["AUC"].append(AUC)
+    dictionary["AverageAccuracy"].append(AverageAccuracy)
+    dictionary["metric"].append(metric)
+    return dictionary
+
+def write_csv(dictionary, fold, split, model_dir):
     '''
     Args:
-        y: a tensor containing true labels
-        y_pred: a tensor containing prdicted values without argmax
-        y_trans: transformation setting for y
-        y_pred_trans: transformation setting for y_pred
-    Return:
-        a float of auc value
+        dictionary: a dictionary containing the loss and metric values
+        fold: the k-fold number now it is
+        split: tr, ts, or val
     '''
-    auc_metric = ROCAUCMetric()
-    y_onehot = [y_trans(i) for i in decollate_batch(y, detach=False)]
-    y_pred_act = [y_pred_trans(i) for i in decollate_batch(y_pred)]
-    auc_metric(y_pred_act, y_onehot)
-    auc_value = auc_metric.aggregate()
-    auc_metric.reset()
-    del y_pred_act, y_onehot
-    return auc_value
+    # Convert dictionary to rows of data
+    rows = []
+    epochs = range(1, len(next(iter(dictionary.values()))) + 1)
+    for epoch in epochs:
+        row = [epoch]
+        for key in dictionary:
+            if key == "metric":
+                continue
+            else:
+                row.append(dictionary[key][epoch - 1])
+        rows.append(row)
 
-def calaulate_metric(y, y_pred):
+    # Write to CSV
+    csv_path = os.path.join(model_dir, "csv")
+    if not os.path.exists(csv_path):
+        os.makedirs(csv_path)
+    filename = f"{split}_fold{fold}.csv"
+    file_dir = os.path.join(csv_path, filename)
+    with open(file_dir, 'w', newline='') as file:
+        writer = csv.writer(file)
+        # Writing headers
+        headers = ['Epoch'] + [key for key in dictionary.keys() if key != "metric"]
+        writer.writerow(headers)
+        # Writing data
+        writer.writerows(rows)
+
+    print(f"{filename} created")
+
+####################
+## Plotting
+def get_mean_std(list_w_dicts, metric):
+    metric_values = [fold[metric] for fold in list_w_dicts]
+    metric_values = list(zip(*metric_values))
+
+    means = [np.mean(epoch) for epoch in metric_values]
+    stds = [np.std(epoch) for epoch in metric_values]
+    return means, stds
+
+def save_progress(train_history_cv, val_history_cv, save_path):
+    fig, axes = plt.subplots(3, 3, figsize=(20, 15))
+
+    tr_epoch_loss_m, tr_epoch_loss_std = get_mean_std(train_history_cv, metric="epoch_loss")
+    v_epoch_loss_m, v_epoch_loss_std = get_mean_std(val_history_cv, metric='epoch_loss')
+    tr_epochs = range(1, len(tr_epoch_loss_m) + 1)
+    v_epochs = range(1, len(v_epoch_loss_m) + 1)
+    axes[0,0].plot(tr_epochs, tr_epoch_loss_m, label=f'training')
+    axes[0,0].plot(v_epochs, v_epoch_loss_m, label=f'validation')
+    axes[0,0].fill_between(tr_epochs, np.array(tr_epoch_loss_m)-np.array(tr_epoch_loss_std), np.array(tr_epoch_loss_m)+np.array(tr_epoch_loss_std), alpha=0.3)
+    axes[0,0].fill_between(v_epochs, np.array(v_epoch_loss_m)-np.array(v_epoch_loss_std), np.array(v_epoch_loss_m)+np.array(v_epoch_loss_std), alpha=0.3)
+    axes[0,0].legend()
+    axes[0,0].set_title("Epoch Average Loss")
+    axes[0,0].set_xlabel("epoch")
+
+    tr_AUC_m, tr_AUC_sd = get_mean_std(train_history_cv, metric="AUC")
+    v_AUC_m, v_AUC_sd = get_mean_std(val_history_cv, metric='AUC')
+    tr_epochs = range(1, len(tr_AUC_m) + 1)
+    v_epochs = range(1, len(v_AUC_m) + 1)
+    axes[0,1].plot(tr_epochs, tr_AUC_m, label=f'training')
+    axes[0,1].plot(v_epochs, v_AUC_m, label=f'validation')
+    axes[0,1].fill_between(tr_epochs, np.array(tr_AUC_m) - np.array(tr_AUC_sd), np.array(tr_AUC_m) + np.array(tr_AUC_sd), alpha=0.3)
+    axes[0,1].fill_between(v_epochs, np.array(v_AUC_m) - np.array(v_AUC_sd), np.array(v_AUC_m) + np.array(v_AUC_sd), alpha=0.3)
+    axes[0,1].legend()
+    axes[0,1].set_title("AUC")
+    axes[0,1].set_xlabel("epoch")
+    axes[0,1].set_ylim(bottom=0);
+
+    tr_Accuracy_m, tr_Accuracy_sd = get_mean_std(train_history_cv, metric="Accuracy")
+    v_Accuracy_m, v_Accuracy_sd = get_mean_std(val_history_cv, metric='Accuracy')
+    tr_epochs = range(1, len(tr_Accuracy_m) + 1)
+    v_epochs = range(1, len(v_Accuracy_m) + 1)
+    axes[0,2].plot(tr_epochs, tr_Accuracy_m, label=f'training')
+    axes[0,2].plot(v_epochs, v_Accuracy_m, label=f'validation')
+    axes[0,2].fill_between(tr_epochs, np.array(tr_Accuracy_m) - np.array(tr_Accuracy_sd), np.array(tr_Accuracy_m) + np.array(tr_Accuracy_sd), alpha=0.3)
+    axes[0,2].fill_between(v_epochs, np.array(v_Accuracy_m) - np.array(v_Accuracy_sd), np.array(v_Accuracy_m) + np.array(v_Accuracy_sd), alpha=0.3)
+    axes[0,2].legend()
+    axes[0,2].set_title("Accuracy")
+    axes[0,2].set_xlabel("epoch")
+    axes[0,2].set_ylim(bottom=0, top=1);
+
+    ## row 2
+    tr_Sensitivity_m, tr_Sensitivity_sd = get_mean_std(train_history_cv, metric="Sensitivity")
+    v_Sensitivity_m, v_Sensitivity_sd = get_mean_std(val_history_cv, metric='Sensitivity')
+    tr_epochs = range(1, len(tr_Sensitivity_m) + 1)
+    v_epochs = range(1, len(v_Sensitivity_m) + 1)
+    axes[1,0].plot(tr_epochs, tr_Sensitivity_m, label=f'training')
+    axes[1,0].plot(v_epochs, v_Sensitivity_m, label=f'validation')
+    axes[1,0].fill_between(tr_epochs, np.array(tr_Sensitivity_m) - np.array(tr_Sensitivity_sd), np.array(tr_Sensitivity_m) + np.array(tr_Sensitivity_sd), alpha=0.3)
+    axes[1,0].fill_between(v_epochs, np.array(v_Sensitivity_m) - np.array(v_Sensitivity_sd), np.array(v_Sensitivity_m) + np.array(v_Sensitivity_sd), alpha=0.3)
+    axes[1,0].legend()
+    axes[1,0].set_title("Sensitivity")
+    axes[1,0].set_xlabel("epoch")
+    axes[1,0].set_ylim(bottom=0, top=1);
+
+    tr_Specificity_m, tr_Specificity_sd = get_mean_std(train_history_cv, metric="Specificity")
+    v_Specificity_m, v_Specificity_sd = get_mean_std(val_history_cv, metric='Specificity')
+    tr_epochs = range(1, len(tr_Specificity_m) + 1)
+    v_epochs = range(1, len(v_Specificity_m) + 1)
+    axes[1,1].plot(tr_epochs, tr_Specificity_m, label=f'training')
+    axes[1,1].plot(v_epochs, v_Specificity_m, label=f'validation')
+    axes[1,1].fill_between(tr_epochs, np.array(tr_Specificity_m) - np.array(tr_Specificity_sd), np.array(tr_Specificity_m) + np.array(tr_Specificity_sd), alpha=0.3)
+    axes[1,1].fill_between(v_epochs, np.array(v_Specificity_m) - np.array(v_Specificity_sd), np.array(v_Specificity_m) + np.array(v_Specificity_sd), alpha=0.3)
+    axes[1,1].legend()
+    axes[1,1].set_title("Specificity")
+    axes[1,1].set_xlabel("epoch")
+    axes[1,1].set_ylim(bottom=0, top=1);
+
+    tr_Precision_m, tr_Precision_sd = get_mean_std(train_history_cv, metric="Precision")
+    v_Precision_m, v_Precision_sd = get_mean_std(val_history_cv, metric='Precision')
+    tr_epochs = range(1, len(tr_Precision_m) + 1)
+    v_epochs = range(1, len(v_Precision_m) + 1)
+    axes[1,2].plot(tr_epochs, tr_Precision_m, label=f'training')
+    axes[1,2].plot(v_epochs, v_Precision_m, label=f'validation')
+    axes[1,2].fill_between(tr_epochs, np.array(tr_Precision_m) - np.array(tr_Precision_sd), np.array(tr_Precision_m) + np.array(tr_Precision_sd), alpha=0.3)
+    axes[1,2].fill_between(v_epochs, np.array(v_Precision_m) - np.array(v_Precision_sd), np.array(v_Precision_m) + np.array(v_Precision_sd), alpha=0.3)
+    axes[1,2].legend()
+    axes[1,2].set_title("Precision")
+    axes[1,2].set_xlabel("epoch")
+    axes[1,2].set_ylim(bottom=0, top=1);
+
+    ## row 3
+    tr_NPV_m, tr_NPV_sd = get_mean_std(train_history_cv, metric="NPV")
+    v_NPV_m, v_NPV_sd = get_mean_std(val_history_cv, metric='NPV')
+    tr_epochs = range(1, len(tr_NPV_m) + 1)
+    v_epochs = range(1, len(v_NPV_m) + 1)
+    axes[2,0].plot(tr_epochs, tr_NPV_m, label=f'training')
+    axes[2,0].plot(v_epochs, v_NPV_m, label=f'validation')
+    axes[2,0].fill_between(tr_epochs, np.array(tr_NPV_m) - np.array(tr_NPV_sd), np.array(tr_NPV_m) + np.array(tr_NPV_sd), alpha=0.3)
+    axes[2,0].fill_between(v_epochs, np.array(v_NPV_m) - np.array(v_NPV_sd), np.array(v_NPV_m) + np.array(v_NPV_sd), alpha=0.3)
+    axes[2,0].legend()
+    axes[2,0].set_title("NPV")
+    axes[2,0].set_xlabel("epoch")
+    axes[2,0].set_ylim(bottom=0, top=1);
+
+    tr_F1_score_m, tr_F1_score_sd = get_mean_std(train_history_cv, metric="F1_score")
+    v_F1_score_m, v_F1_score_sd = get_mean_std(val_history_cv, metric='F1_score')
+    tr_epochs = range(1, len(tr_F1_score_m) + 1)
+    v_epochs = range(1, len(v_F1_score_m) + 1)
+    axes[2,1].plot(tr_epochs, tr_F1_score_m, label=f'training')
+    axes[2,1].plot(v_epochs, v_F1_score_m, label=f'validation')
+    axes[2,1].fill_between(tr_epochs, np.array(tr_F1_score_m) - np.array(tr_F1_score_sd), np.array(tr_F1_score_m) + np.array(tr_F1_score_sd), alpha=0.3)
+    axes[2,1].fill_between(v_epochs, np.array(v_F1_score_m) - np.array(v_F1_score_sd), np.array(v_F1_score_m) + np.array(v_F1_score_sd), alpha=0.3)
+    axes[2,1].legend()
+    axes[2,1].set_title("F1_score")
+    axes[2,1].set_xlabel("epoch")
+    axes[2,1].set_ylim(bottom=0, top=1);
+
+    tr_AverageAccuracy_m, tr_AverageAccuracy_sd = get_mean_std(train_history_cv, metric="AverageAccuracy")
+    v_AverageAccuracy_m, v_AverageAccuracy_sd = get_mean_std(val_history_cv, metric='AverageAccuracy')
+    tr_epochs = range(1, len(tr_AverageAccuracy_m) + 1)
+    v_epochs = range(1, len(v_AverageAccuracy_m) + 1)
+    axes[2,2].plot(tr_epochs, tr_AverageAccuracy_m, label=f'training')
+    axes[2,2].plot(v_epochs, v_AverageAccuracy_m, label=f'validation')
+    axes[2,2].fill_between(tr_epochs, np.array(tr_AverageAccuracy_m) - np.array(tr_AverageAccuracy_sd), np.array(tr_AverageAccuracy_m) + np.array(tr_AverageAccuracy_sd), alpha=0.3)
+    axes[2,2].fill_between(v_epochs, np.array(v_AverageAccuracy_m) - np.array(v_AverageAccuracy_sd), np.array(v_AverageAccuracy_m) + np.array(v_AverageAccuracy_sd), alpha=0.3)
+    axes[2,2].legend()
+    axes[2,2].set_title("Average Accuracy")
+    axes[2,2].set_xlabel("epoch")
+    axes[2,2].set_ylim(bottom=0, top=1);
+
+    save_dir = os.path.join(save_path, "snap_cv.png")
+    plt.savefig(save_dir)
+    
+def plotting(y_truth, y_prediction, y_score, model_name:str, save_path, show=False):
     '''
+    Plotting the confusion matrix and ROC plot
+    
     Args:
-        y: a tensor contating true labels
-        y_pred: a tensor containing prdicted values after argmax
-    Return:
-        metric: a tuple containing 4 values of TP, FP, FN, TN
-        avg_sensitivity: average sensitivity value
-        avg_specificity: average specificity value
+        y_truth and y_prediction should both be lists or tensors with the multiclass label of each object, e.g.
+    
+        y_truth = [0, 0, 0,	0, 0, 0, 2, 2, 1, 1, 2]         ### Groundtruth
+        y_prediction = [0, 0, 0, 0, 0, 0, 1, 2, 1, 2, 2]    ### Predicted labels
+        y_score = [[0.3, 0.3, 0.4], [0.2, 0.6, 0.2], ... ]  ### Normalized score per patient for all labels (three in this example)
+        model_name = (Best metric) or (Final model)
     '''
-    # Move tensors to CPU if they are on GPU
-    if y.is_cuda:
-        y = y.cpu()
-    if y_pred.is_cuda:
-        y_pred = y_pred.cpu()
-        
-    cm = confusion_matrix(y, y_pred)
-    TP = np.diag(cm)
-    FP = np.sum(cm, axis=0) - TP
-    FN = np.sum(cm, axis=1) - TP
-    TN = np.sum(cm) - (FP + FN + TP)
-    # Calculate Sensitivity(Recall) and Specificity for each class
-    sensitivity = TP / (TP + FN)
-    avg_sensitivity = sum(sensitivity)/len(sensitivity)
-    specificity = TN / (TN + FP)
-    avg_specificity = sum(specificity)/len(specificity)
-    return (TP, FP, FN, TN), avg_sensitivity, avg_specificity
-        
+    # Set model name
+    if "best" in model_name:
+        model_name = "(Best metric)"
+    elif "final" in model_name:
+        model_name = "(Final metric)"
+    else:
+        raise ValueError("Only take 'best' or 'final'.")
+    
+    class_names = ["HCA","FNH","HCC"]
+    
+    # Confusion matrix
+    cm = pd.DataFrame(confusion_matrix(y_truth, y_prediction), 
+                    index=class_names, 
+                    columns=class_names)
+    plt.figure(figsize=(5,4))
+    sns.heatmap(cm, annot=True)
+    plt.title(f"Confusion Matrix {model_name}")
+    plt.ylabel('Actal Values')
+    plt.xlabel('Predicted Values')
+    
+    if model_name == "(Best metric)":
+        save_dir = os.path.join(save_path, "cm_best_metric.png")
+    elif model_name == "(Final metric)":
+        save_dir = os.path.join(save_path, "cm_final_model.png")
+    plt.savefig(save_dir)
+    print("Confusion matrix is saved!")
+    
+    if show:
+        plt.show()
+    
+    # Create ROC plot
+    y_truth_binarized = label_binarize(y_truth, classes=[0, 1, 2])
+    n_classes = y_truth_binarized.shape[1]
 
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_truth_binarized[:, i], [score[i] for score in y_score])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+
+    plt.figure()
+    for i in range(n_classes):
+        plt.plot(fpr[i], tpr[i], label=f'ROC curve of {class_names[i]} (area = {roc_auc[i]:.2f})')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.title(f"Multi-class ROC {model_name}")
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.legend(loc="lower right")
+    
+    if model_name == "(Best metric)":
+        save_dir = os.path.join(save_path, "ROC_best_metric.png")
+    elif model_name == "(Final metric)":
+        save_dir = os.path.join(save_path, "ROC_final_model.png")
+    plt.savefig(save_dir)
+    print("ROC plot is saved!")
+    
+    if show:
+        plt.show()
+         
+    
+################################## MAIN ##################################
 def main():
+    
     ####################
-    ### Setup
+    ##      Setup     ##
+    ####################
     monai.config.print_config()
     logging.basicConfig(stream=sys.stdout, level=logging.INFO)
     
@@ -163,72 +480,47 @@ def main():
     ####################
     ### Set path, change if needed
     script_dir = os.getcwd()
-    model_dir = os.path.join(script_dir, "data", "BLT_radiomics", "models", "densenet")
-    img4D_dir = "/data/scratch/r098906/BLT_radiomics/4D_new_registered/images"
-    seg4D_dir = "/data/scratch/r098906/BLT_radiomics/4D_new_registered/segs"
-    # data_dir = os.path.join(script_dir, "data", "BLT_radiomics", "image_files")
-    # img4D_dir = os.path.join(script_dir, "data", "BLT_radiomics", "4D_old_registered", "images")
-    # seg4D_dir = os.path.join(script_dir, "data", "BLT_radiomics", "4D_old_registered", "segs")
+    model_folder = os.path.join(script_dir, "data", "BLT_radiomics", "models", "densenet")
+    model_dir = os.path.join(model_folder, attempt)
+    if not os.path.exists(model_dir):
+        os.mkdir(model_dir)
+    
+    if 'r098906' in script_dir:
+        GPU_cluster = True
+    else:
+        GPU_cluster = False
+    
+    img4D_dir = os.path.join(script_dir, "data", "BLT_radiomics", "image_files", "4D_new_registered", "images")
+    seg4D_dir = os.path.join(script_dir, "data", "BLT_radiomics", "image_files", "4D_new_registered", "segs")
+    label_dir = os.path.join(script_dir, "data", "BLT_radiomics", "labels_all_phases_NEW.csv")
+    if GPU_cluster:
+        img4D_dir = "/data/scratch/r098906/BLT_radiomics/4D_new_registered/images"
+        seg4D_dir = "/data/scratch/r098906/BLT_radiomics/4D_new_registered/segs"
+        label_dir = os.path.join(script_dir, "data", "labels_all_phases_NEW.csv")
+    
 
     ####################
-    ### Load the data
-    # image files
-    images = []
+    ### Load data
+    # images and segmentations
+    images = []     # image files
     for file in os.listdir(img4D_dir):
         if file.endswith(".nii.gz"):
             images.append(os.path.join(img4D_dir, file))
-        
-    # segmentation files
-    segs = []
+    segs = []       # segmentation files
     for file in os.listdir(seg4D_dir):
         if file.endswith(".nii.gz"):
             segs.append(os.path.join(seg4D_dir, file))
-        
-    # label data
-    # label_dir = os.path.join(script_dir, "data", "BLT_radiomics", "labels_all_phases_NEW.csv")
-    label_dir = os.path.join(script_dir, "data", "labels_all_phases_NEW.csv")
+    
+    # label
     labels = pd.read_csv(label_dir)["Pheno"].to_numpy()
     labels[labels == 4] = 2
     labels = torch.from_numpy(labels)
     num_class = len(np.unique(labels, axis=0))
-
     print(f"image data count: {len(images)}.\nsegmetation data count: {len(segs)}.\nnumber of class: {num_class}.")
 
     ####################
-    ## Split data
-    # Split dataset into train+val and test sets
-    random_state = np.random.RandomState()
-    sss1 = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=random_state)
-    train_val_idx, test_idx = next(sss1.split(list(range(len(images))), labels))
-
-    # Further split train+val into train and val sets
-    sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.25, random_state=random_state)  # 0.25 x 0.8 = 0.2
-    train_idx, val_idx = next(sss2.split(train_val_idx, [labels[i] for i in train_val_idx]))
-
-    seed = random_state.get_state()[1][0]
-    print(f"Random state seed used: {seed}")
-
-    # Adjust indices to original dataset
-    train_idx = [train_val_idx[i] for i in train_idx]
-    val_idx = [train_val_idx[i] for i in val_idx]
-
-    train_x = [images[i] for i in train_idx]
-    train_seg = [segs[i] for i in train_idx]
-    train_y = [labels[i] for i in train_idx]
-
-    val_x = [images[i] for i in val_idx]
-    val_seg = [segs[i] for i in val_idx]
-    val_y = [labels[i] for i in val_idx]
-
-    test_x = [images[i] for i in test_idx]
-    test_seg = [segs[i] for i in test_idx]
-    test_y = [labels[i] for i in test_idx]
-    check_dataoverlap(train_x, val_x, test_x)
-    print(f"Training count: {len(train_x)}, Validation count: " f"{len(val_x)}, Test count: {len(test_x)}")
-
+    ##   Transforms   ##
     ####################
-    ## Define transforms and dataloader
-    # Define transforms
     train_transforms = Compose([
         EnsureChannelFirst(), Resize((78,78,31)),
         # Data augmentation
@@ -236,238 +528,242 @@ def main():
         RandGaussianNoise(std=0.05, prob=0.5),
         RandZoom(prob = 0.3, min_zoom=1.0, max_zoom=1.2), ToTensor()])
     val_transforms = Compose([EnsureChannelFirst(), Resize((78,78,31))])
-    y_trans = Compose([AsDiscrete(to_onehot=num_class)])
-    y_pred_trans = Compose([Activations(softmax=True)])
+    # y_trans = Compose([AsDiscrete(to_onehot=num_class)])
+    # y_pred_trans = Compose([Activations(softmax=True)])
+    
+    
+    ####################
+    ##    Test set    ##
+    ####################
+    sss_ts = StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=42)
+    for train_val_idx, test_idx in sss_ts.split(images, labels):
+        train_val_x = [images[i] for i in train_val_idx]
+        train_val_seg = [segs[i] for i in train_val_idx]
+        train_val_y = [labels[i] for i in train_val_idx]
 
-    # Define image dataset, data loader
-    # check_ds = ImageDataset(image_files=images, seg_files=segs, labels=labels,
-    #                         transform=train_transforms, seg_transform=train_transforms)
-    # check_loader = DataLoader(check_ds, batch_size=17, num_workers=2, pin_memory=torch.cuda.is_available())
-    # # check the data
-    # im, seg, label = monai.utils.misc.first(check_loader)
-    # print(type(im), im.shape, seg.shape, label)
-
-    # create a data loader
-    batch_size = 1
-    train_ds = ImageDataset(image_files=train_x, seg_files=train_seg, labels=train_y,
-                            transform=train_transforms, seg_transform=train_transforms)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
-
-    # create a validation data loader
-    val_ds = ImageDataset(image_files=val_x, seg_files=val_seg, labels=val_y, 
-                        transform=val_transforms, seg_transform=val_transforms)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=2, pin_memory=torch.cuda.is_available())
-
-    # create a test data loader
+        test_x = [images[i] for i in test_idx]
+        test_seg = [segs[i] for i in test_idx]
+        test_y = [labels[i] for i in test_idx]
+    
     test_ds = ImageDataset(image_files=test_x, seg_files=test_seg, labels=test_y, 
-                        transform=val_transforms, seg_transform=val_transforms)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, num_workers=2, pin_memory=torch.cuda.is_available())
+                       transform=val_transforms, seg_transform=val_transforms)
+    test_loader = DataLoader(test_ds, batch_size=25, num_workers=2, pin_memory=torch.cuda.is_available())
     
-    ####################
-    ## Create the model, loss function and optimizer
-    model = monai.networks.nets.DenseNet121(spatial_dims=3, in_channels=5, out_channels=num_class, norm='instance').to(device)
-    loss_function = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
-    ema = EMA(model)
+    print("% TEST SET %")
+    print(test_x)
+    print(test_seg)
+    print(test_y)
 
-    ####################
-    ## Training & validation
-    # settings
-    save_model = os.path.join(model_dir, attempt+".pth")
-    if os.path.exists(save_model):
-        raise ValueError("The model already exists")
+    ######################
+    ## Cross validation ##
+    ######################
+    # lists to store data from the cv 
+    metrics_best = list()
+    metrics_final = list()
+    models_best = list()
+    models_final = list()
+    models_finalEMA = list()
+    models_bestEMA = list()
+    train_history_cv = list()
+    val_history_cv = list() 
+    
+    kfold = 2
+    sss = StratifiedShuffleSplit(n_splits=kfold, test_size=0.13, random_state=1)
+    for fold, (train_idx, val_idx) in enumerate(sss.split(train_val_x, train_val_y)):
+        print("-" * 30)
+        print(f"Fold: {fold+1}/{kfold}")
+        train_x = [train_val_x[i] for i in train_idx]
+        train_seg = [train_val_seg[i] for i in train_idx]
+        train_y = [train_val_y[i] for i in train_idx]
 
-    max_epochs = 100
-    val_interval = 1
-    best_metric = -1
-    best_metric_epoch = -1
-    writer = SummaryWriter()
-
-    # store the data
-    train_history = {
-        "epoch_loss": [],
-        "AUC": [],
-        "metric": [],
-        "sensitivity": [],
-        "specificity": []}
-
-    val_history = {
-        "AUC": [],
-        "metric": [],
-        "sensitivity": [],
-        "specificity": []}
-
-    for epoch in range(max_epochs):
-        print("-" * 15)
-        print(f"epoch {epoch + 1}/{max_epochs}")
-        print("#"*3+" Training")
-        model.train()
+        val_x = [train_val_x[i] for i in val_idx]
+        val_seg = [train_val_seg[i] for i in val_idx]
+        val_y = [train_val_y[i] for i in val_idx]
+        check_dataoverlap(train_x, val_x, test_x)
         
-        epoch_loss = 0
-        step = 0
-        y, y_pred, y_pred_argmax = create_empty_predict_lists(device)
+        ####################
+        ## Create dataloader
+        train_ds = ImageDataset(image_files=train_x, seg_files=train_seg, labels=train_y,
+                            transform=train_transforms, seg_transform=train_transforms)
+        train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
+        val_ds = ImageDataset(image_files=val_x, seg_files=val_seg, labels=val_y, 
+                            transform=val_transforms, seg_transform=val_transforms)
+        val_loader = DataLoader(val_ds, batch_size=1, num_workers=2, pin_memory=torch.cuda.is_available())
 
-        for batch_data in train_loader:
-            step += 1
-            train_images, train_segs, train_labels = (
-                batch_data[0].to(device), 
-                batch_data[1].to(device), 
-                batch_data[2].to(device))
-            masked_train_images = torch.cat((train_images,train_segs[:,0:1,:,:]), dim=1) 
-            
-            # forward and backward pass
-            optimizer.zero_grad()
-            train_pred = model(masked_train_images)
-            train_pred_argmax = train_pred.argmax(dim=1)
-            loss = loss_function(train_pred, train_labels)
-            loss.backward()
-            optimizer.step()
-            # lrs.append(optimizer.param_groups[0]["lr"])
-            # scheduler.step()
-            ema.update()
-            epoch_loss += loss.item()
-            
-            epoch_len = len(train_ds) // train_loader.batch_size
-            print(f"{step}/{epoch_len}, train_loss: {loss.item():.4f}")
-            writer.add_scalar("train_loss", loss.item(), epoch_len * epoch + step)
-            
-            # append the predicted value
-            y = torch.cat([y, train_labels], dim=0)
-            y_pred = torch.cat([y_pred, train_pred], dim=0)
-            y_pred_argmax = torch.cat([y_pred_argmax, train_pred_argmax], dim=0)
+        ####################
+        ## Create Model, Loss, Optimizer
+        model = monai.networks.nets.DenseNet121(spatial_dims=3, in_channels=5, out_channels=num_class, norm='instance').to(device)
+        loss_function = torch.nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+        use_ema = True
+        max_epochs = 2
+        val_interval = 1
+        best_metric = -1
+        best_metric_epoch = -1
         
-        auc_value = calaulate_auc(y, y_pred, y_trans, y_pred_trans)
-        metric, avg_sensitivity, avg_specificity = calaulate_metric(y, y_pred_argmax)
-        train_history["AUC"].append(auc_value)
-        train_history["metric"].append(metric)
-        train_history["sensitivity"].append(avg_sensitivity)
-        train_history["specificity"].append(avg_specificity)
+        if use_ema:
+            ema = EMA(
+                model,
+                beta = 0.9999,          # exponential moving average factor
+                update_after_step = 5,  # only after this number of .update() calls will it start updating
+                update_every = 5)       # how often to actually update, to save on compute (updates every 10th .update() call)
         
-        epoch_loss /= step
-        train_history["epoch_loss"].append(epoch_loss)
-        print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
-        
-        if (epoch + 1) % val_interval == 0:
-            print("#"*3+" Validation")
-            ema.apply_shadow()
-            model.eval()
+        ######################
+        ##     Training     ##
+        ######################
+        train_history = empty_history_dict()
+        val_history = empty_history_dict()
+
+        for epoch in range(max_epochs):
+            print("-" * 10)
+            print(f"epoch {epoch + 1}/{max_epochs}")
+            print("#"*3+" Training")
+            model.train()
             
-            y_val, y_val_pred, y_val_pred_argmax = create_empty_predict_lists(device)
+            epoch_loss = 0
+            step = 0
+            y, y_pred, y_pred_argmax = create_empty_predict_lists(device)
+
+            for batch_data in train_loader:
+                step += 1
+                train_images, train_segs, train_labels = (
+                    batch_data[0].to(device), 
+                    batch_data[1].to(device), 
+                    batch_data[2].to(device))
+                masked_train_images = torch.cat((train_images,train_segs[:,0:1,:,:]), dim=1) 
+                
+                # forward and backward pass
+                optimizer.zero_grad()
+                train_pred = model(masked_train_images)
+                train_pred_argmax = train_pred.argmax(dim=1)
+                loss = loss_function(train_pred, train_labels)
+                loss.backward()
+                optimizer.step()
+                ema.update()
+                epoch_loss += loss.item()
+                
+                epoch_len = len(train_ds) // train_loader.batch_size
+                if (step % 20 == 0) or (step == epoch_len): # only print every 20 and the last steps
+                    print(f"{step}/{epoch_len}, train_loss: {loss.item():.4f}")
+                
+                # append the predicted values and calculate the metrics
+                y = torch.cat([y, train_labels], dim=0)
+                y_pred = torch.cat([y_pred, train_pred], dim=0)
+                y_pred_argmax = torch.cat([y_pred_argmax, train_pred_argmax], dim=0)
+            Accuracy, Sensitivity, Specificity, Precision, NPV, F1_score, AUC, AverageAccuracy, metric = performance_multiclass(y, y_pred_argmax, y_pred)
+            train_history = append_metrics(train_history, Accuracy, Sensitivity, Specificity, Precision, NPV, F1_score, AUC, AverageAccuracy, metric)
             
-            with torch.no_grad():
-                for val_data in val_loader:
-                    val_images, val_segs, val_labels = (
-                        val_data[0].to(device),
-                        val_data[1].to(device),
-                        val_data[2].to(device))
-                    masked_val_images = torch.cat((val_images,val_segs[:,0:1,:,:]), dim=1)
+            epoch_loss /= step
+            train_history["epoch_loss"].append(epoch_loss)
+            print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
+            
+            ####################
+            ## Validation / Testing
+            if (epoch + 1) % val_interval == 0:
+                print("#"*3+" Validation")
+                model.eval()
+                
+                v_epoch_loss = 0
+                v_step = 0
+                y_val, y_val_pred, y_val_pred_argmax = create_empty_predict_lists(device)
+                
+                with torch.no_grad():
+                    for val_data in val_loader:
+                        v_step += 1
+                        val_images, val_segs, val_labels = (
+                            val_data[0].to(device),
+                            val_data[1].to(device),
+                            val_data[2].to(device))
+                        masked_val_images = torch.cat((val_images,val_segs[:,0:1,:,:]), dim=1)
+                        
+                        # forward
+                        val_pred = model(masked_val_images)
+                        if use_ema:
+                            val_pred = ema(masked_val_images)
+                        val_pred_argmax = val_pred.argmax(dim=1)
+                        v_loss = loss_function(val_pred, val_labels)
+                        v_epoch_loss += v_loss.item()
+
+                        # append the predicted values and calculate the metrics
+                        y_val = torch.cat([y_val, val_labels], dim=0)
+                        y_val_pred = torch.cat([y_val_pred, val_pred], dim=0)
+                        y_val_pred_argmax = torch.cat([y_val_pred_argmax, val_pred_argmax], dim=0)
+                    vAccuracy, vSensitivity, vSpecificity, vPrecision, vNPV, vF1_score, vAUC, vAverageAccuracy, vmetric = performance_multiclass(y_val, y_val_pred_argmax, y_val_pred)
+                    val_history = append_metrics(val_history, vAccuracy, vSensitivity, vSpecificity, vPrecision, vNPV, vF1_score, vAUC, vAverageAccuracy, vmetric)
                     
-                    val_pred = model(masked_val_images)
-                    val_pred_argmax = val_pred.argmax(dim=1)
+                    v_epoch_loss /= v_step
+                    val_history["epoch_loss"].append(v_epoch_loss)
+                    
+                    if vAUC > best_metric:
+                        best_metric = vAUC
+                        best_metric_epoch = epoch + 1
+                        best_model = model
+                        best_model_ema = ema.ema_model
+                        # save_model = os.path.join(model_dir, attempt+"_bestauc.pth")
+                        # torch.save(model.state_dict(), save_model)
+                        # print(f"Save new best metric model: {attempt}_bestauc.pth")
+                    print(f"Current epoch: {epoch+1}, AUC: {vAUC:.4f}")
+                    print(f"Sensitivity: {vSensitivity:.4f}, Specificity: {vSpecificity:.4f}")
+                    print(f"Best AUC: {best_metric:.4f} at epoch {best_metric_epoch}")
 
-                    # append value to the lists
-                    y_val = torch.cat([y_val, val_labels], dim=0)
-                    y_val_pred = torch.cat([y_val_pred, val_pred], dim=0)
-                    y_val_pred_argmax = torch.cat([y_val_pred_argmax, val_pred_argmax], dim=0)
-                
-                val_auc_value = calaulate_auc(y_val, y_val_pred, y_trans, y_pred_trans)
-                val_metric, val_avg_sensitivity, val_avg_specificity = calaulate_metric(y_val, y_val_pred_argmax)
-                val_history["AUC"].append(val_auc_value)
-                val_history["metric"].append(val_metric)
-                val_history["sensitivity"].append(val_avg_sensitivity)
-                val_history["specificity"].append(val_avg_specificity) 
-                
-                if val_auc_value > best_metric:
-                    best_metric = val_auc_value
-                    best_metric_epoch = epoch + 1
-                    torch.save(model.state_dict(), save_model)
-                    print(f"Save new best metric model: {attempt}.pth")
-                print(f"Current epoch: {epoch+1}, AUC: {val_auc_value:.4f}")
-                print(f"Sensitivity: {val_avg_sensitivity:.4f}, Specificity: {val_avg_specificity:.4f}")
-                print(f"Best AUC: {best_metric:.4f} at epoch {best_metric_epoch}")
-                writer.add_scalar("val_AUC", val_auc_value, epoch + 1)
-                ema.restore()
+        # save the data of final epoch
+        print(f"current epoch: {epoch+1}")
+        print("Save all models")
+        models_final.append(model)
+        metrics_final.append(vAUC)
+        models_best.append(best_model)
+        metrics_best.append(best_metric)
+        models_finalEMA.append(ema.ema_model)
+        models_bestEMA.append(best_model_ema)
+        train_history_cv.append(train_history)
+        val_history_cv.append(val_history)
+        write_csv(train_history, fold+1, "tr", model_dir)
+        write_csv(val_history, fold+1, "ts", model_dir)
+        save_progress(train_history_cv, val_history_cv, model_dir)
         
-    print(f"train completed, best_metric: {best_metric:.4f} " f"at epoch: {best_metric_epoch}")
-    writer.close()
+        print("-" * 10)                
+        print(f"Fold {fold+1} train completed, , best_metric: {best_metric:.4f} " f"at epoch: {best_metric_epoch}")    
+    
+    # save all the models
+    for m in range(len(models_best)):
+        file_name = f"model_best_fold_{str(m+1)}.pth"
+        save_model = os.path.join(model_dir, file_name)
+        torch.save(models_best[m].state_dict(), save_model)
+    for m in range(len(models_final)):
+        file_name = f"model_final_fold_{str(m+1)}.pth"
+        save_model = os.path.join(model_dir, file_name)
+        torch.save(models_final[m].state_dict(), save_model)
+    for m in range(len(models_finalEMA)):
+        file_name = f"model_finalEMA_fold_{str(m+1)}.pth"
+        save_model = os.path.join(model_dir, file_name)
+        torch.save(models_final[m].state_dict(), save_model)
+    for m in range(len(models_bestEMA)):
+        file_name = f"model_bestEMA_fold_{str(m+1)}.pth"
+        save_model = os.path.join(model_dir, file_name)
+        torch.save(models_final[m].state_dict(), save_model)
     
     ####################
-    ## Plotting the loss and training history
-    # settings
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    x = [i + 1 for i in range(len(train_history["epoch_loss"]))]
-    y = train_history["epoch_loss"]
-    axes[0,0].plot(x, y)
-    axes[0,0].set_title("Epoch Average Loss")
-    axes[0,0].set_xlabel("epoch")
-
-    x = [val_interval * (i + 1) for i in range(len(train_history["AUC"]))]
-    y1 = train_history["AUC"]
-    y2 = val_history["AUC"]
-    axes[0,1].plot(x, y1, label="training")
-    axes[0,1].plot(x, y2, label="validation")
-    axes[0,1].legend()
-    axes[0,1].set_title("AUC")
-    axes[0,1].set_xlabel("epoch")
-    axes[0,1].set_ylim(bottom=0);
-
-    x = [val_interval * (i + 1) for i in range(len(train_history["sensitivity"]))]
-    y1 = train_history["sensitivity"]
-    y2 = val_history["sensitivity"]
-    axes[1,0].plot(x, y1, label="training")
-    axes[1,0].plot(x, y2, label="validation")
-    axes[1,0].legend()
-    axes[1,0].set_title("Sensitivity")
-    axes[1,0].set_xlabel("epoch")
-    axes[1,0].set_ylim(bottom=0);
-
-    x = [val_interval * (i + 1) for i in range(len(train_history["specificity"]))]
-    y1 = train_history["specificity"]
-    y2 = val_history["specificity"]
-    axes[1,1].plot(x, y1, label="training")
-    axes[1,1].plot(x, y2, label="validation")
-    axes[1,1].legend()
-    axes[1,1].set_title("Specificity")
-    axes[1,1].set_xlabel("epoch")
-    axes[1,1].set_ylim(bottom=0);
-
-    save_dir = os.path.join(model_dir, "snap", attempt + "_snap.png")
-    plt.savefig(save_dir)
-    
-    # # Calculate mean and standard deviation for both training and test AUC
-    # mean_ts = np.mean(history["ts_AUC_values"])
-    # std_ts = np.std(history["ts_AUC_values"])
-    # mean_tr = np.mean(history["tr_AUC_values"])
-    # std_tr = np.std(history["tr_AUC_values"])
-
-    # # Create an array of x values
-    # x = range(len(history["ts_AUC_values"]))
-
-    # # Plot test AUC values
-    # plt.plot(x, history["ts_AUC_values"], label='Test AUC', color='#06592A')
-    # plt.fill_between(x, history["ts_AUC_values"] - std_ts, history["ts_AUC_values"] + std_ts, color='#06592A', alpha=0.2, label='Test Mean ± Std Dev')
-
-    # # Plot training AUC values
-    # plt.plot(x, history["tr_AUC_values"], label='Train AUC', color='#1F77B4')
-    # plt.fill_between(x, history["tr_AUC_values"] - std_tr, history["tr_AUC_values"] + std_tr, color='#1F77B4', alpha=0.2, label='Train Mean ± Std Dev')
-    
-    # plt.axhline(y=0.5, color='black', linestyle='--', lw=0.8, label='Random')
-    # plt.xlim(0, len(history["ts_AUC_values"]))
-    # plt.ylim(bottom=0)
-    # plt.title('Training and Validation AUC')
-    # plt.legend()
-    # save_dir = os.path.join(model_dir, "snap", attempt + "_new_AUC_snap.png")
-    # plt.savefig(save_dir)
-    # plt.show()
-    
+    ##    Testing     ##
     ####################
-    ## Testing
-    model.load_state_dict(torch.load(os.path.join(model_dir, attempt+".pth"), map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
-    ema.apply_shadow()
+    
+    print("-" * 35)
+    i_best = np.argmax(metrics_best)
+    i_final =  np.argmax(metrics_final)
+    print('Best metric for fold', i_best+1)
+    print('Best final metric for fold', i_final+1)
+    
+    # Set path the store the figures
+    fig_path = os.path.join(model_dir, "fig")
+    if not os.path.exists(fig_path):
+        os.makedirs(fig_path)
+    best_metric_model = f"model_bestEMA_fold_{i_best}.pth"
+    final_metric_model = f"model_finalEMA_fold_{i_final}.pth"
+    
+    ### Best metric model ###
+    model = monai.networks.nets.DenseNet121(spatial_dims=3, in_channels=5, out_channels=num_class, norm='instance').to(device)
+    model.load_state_dict(torch.load(os.path.join(model_dir, best_metric_model), map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
     model.eval()
-
     y_ts, y_ts_pred, y_ts_pred_argmax = create_empty_predict_lists(device)
-
     with torch.no_grad():
         for test_data in test_loader:
             test_images, test_segs, test_labels = (
@@ -479,50 +775,44 @@ def main():
             ts_pred = model(masked_test_images)
             ts_pred_argmax = ts_pred.argmax(dim=1)
             
-            # append the value
+            # append the predicted values and calculate the metrics
             y_ts = torch.cat([y_ts, test_labels], dim=0)
             y_ts_pred = torch.cat([y_ts_pred, ts_pred], dim=0)
             y_ts_pred_argmax = torch.cat([y_ts_pred_argmax, ts_pred_argmax], dim=0)
         
-        ts_auc_value = calaulate_auc(y_ts, y_ts_pred, y_trans, y_pred_trans)
-        ts_metric, ts_avg_sensitivity, ts_avg_specificity = calaulate_metric(y_ts, y_ts_pred_argmax)
-        print(f"Model evaluate on testing set; AUC: {ts_auc_value}")
-        print(f"Sensitivity: {ts_avg_sensitivity:4f}, Specificity: {ts_avg_specificity:4f}")
-       
-    ####################
-    ## Results       
-    TP, FP, FN, TN = ts_metric
-    results = np.vstack((TP, FP, FN, TN)).T
-    results_df = pd.DataFrame(results, columns=["TP", "FP", "FN", "TN"])
-    results_df.index = ["HCA","FNH","HCC"]
-    Recall = TP / (TP + FN)
-    Specificity = TN / (TN + FP)
-
-    # Adding these metrics to the DataFrame
-    results_df["Recall"] = Recall
-    results_df["Specificity"] = Specificity
-    print("\n## metric")
-    print(results_df)
+        Accuracy, Sensitivity, Specificity, Precision, NPV, F1_score, AUC, AverageAccuracy, metric = performance_multiclass(y_ts, y_ts_pred_argmax, y_ts_pred)
+        print(f"\nBest metric model evaluate on testing set; AUC: {AUC:4f}")
+        print(f"Sensitivity: {Sensitivity:.4f}, Specificity: {Specificity:.4f}")
     
+    plotting(y_ts, y_ts_pred_argmax, y_ts_pred, model_name="best", save_path=fig_path)
     
-    if y_ts.is_cuda:
-        y_ts = y_ts.cpu()
-    if y_ts_pred_argmax.is_cuda:
-        y_ts_pred_argmax = y_ts_pred_argmax.cpu()
+    ### Final best model ###
+    model = monai.networks.nets.DenseNet121(spatial_dims=3, in_channels=5, out_channels=num_class, norm='instance').to(device)
+    model.load_state_dict(torch.load(os.path.join(model_dir, final_metric_model), map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
+    model.eval()
+    y_ts, y_ts_pred, y_ts_pred_argmax = create_empty_predict_lists(device)
+    with torch.no_grad():
+        for test_data in test_loader:
+            test_images, test_segs, test_labels = (
+                test_data[0].to(device),
+                test_data[1].to(device),
+                test_data[2].to(device))
+            masked_test_images = torch.cat((test_images,test_segs[:,0:1,:,:]), dim=1)
+            
+            ts_pred = model(masked_test_images)
+            ts_pred_argmax = ts_pred.argmax(dim=1)
+            
+            # append the predicted values and calculate the metrics
+            y_ts = torch.cat([y_ts, test_labels], dim=0)
+            y_ts_pred = torch.cat([y_ts_pred, ts_pred], dim=0)
+            y_ts_pred_argmax = torch.cat([y_ts_pred_argmax, ts_pred_argmax], dim=0)
         
-    print("\n## classification report")
-    print(classification_report(y_ts, y_ts_pred_argmax, target_names=["HCA","FNH","HCC"], digits=3))
+        Accuracy, Sensitivity, Specificity, Precision, NPV, F1_score, AUC, AverageAccuracy, metric = performance_multiclass(y_ts, y_ts_pred_argmax, y_ts_pred)
+        print(f"\nFinal model evaluate on testing set; AUC: {AUC:4f}")
+        print(f"Sensitivity: {Sensitivity:.4f}, Specificity: {Specificity:.4f}")
+        
+    plotting(y_ts, y_ts_pred_argmax, y_ts_pred, model_name="final", save_path=fig_path)
     
-    # Creating  a confusion matrix,which compares the y_test and y_pred
-    cm = confusion_matrix(y_ts, y_ts_pred_argmax)
-    plt.figure(figsize=(5,4))
-    sns.heatmap(cm, annot=True)
-    plt.title('Confusion Matrix')
-    plt.ylabel('Actal Values')
-    plt.xlabel('Predicted Values')
-    save_dir = os.path.join(model_dir, "snap", attempt+"_confusion.png")
-    plt.savefig(save_dir)
-    # plt.show()
 
 if __name__ == "__main__":
     main()
