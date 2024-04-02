@@ -18,39 +18,39 @@ from sklearn.model_selection import train_test_split
 import monai
 from monai.data import CacheDataset, DataLoader, decollate_batch
 from monai.utils import set_determinism
-from monai.transforms import (
-    Compose, EnsureChannelFirstd, CropForegroundd, LoadImaged,
-    NormalizeIntensityd, Orientationd, AsDiscrete,
-    # augmentaion
-    RandRotated, RandZoomd, RandGaussianNoised, RandGaussianSmoothd,
-    RandScaleIntensityd, RandAdjustContrastd, RandFlipd, ToTensord)
+from transforms.set_transforms import training_transforms, post_transfroms
 
 # from monai.networks.nets import UNet
-from model.douweunet import UNet
+from model.douwe_unet import UNet
 from monai.losses import DiceLoss
 from monai.metrics import DiceMetric
 from monai.inferers import sliding_window_inference
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import LambdaLR
 from ema_pytorch import EMA
 
 ####################
 ##   Settings     ##
 ####################
-train_scale = 0.5
-val_scale = 0.5
-lr = 1e-4
-lr_scheduler = False
-max_epochs = 100
-val_interval = 1
-# num_res_units = 0
+TRAIN_SCALE = 0.5
+VAL_SCALE = 0.5
+LR = 0.01
+LR_SCHEDULER = True
+MAX_EPOCHS = 1000
+KERNEL_SIZE = (3, 3, 3)
+VAL_INTERVAL = 1 # always set to 1 to avoid some issue in plotting
+CHECK_INTERVAL = 20
+SLIDING_WINDOW = False
+TEST_MODE = False # use only a small part of data
+
 
 print("##############")
 print("## Settings ##")
 print("##############")
-print(f"scale in training set: {train_scale}; scale in validation set: {val_scale}")
-# print(f"num_res_units: {num_res_units}")
-print(f"learning rate: {lr}; learning rate scheduler: {lr_scheduler}")
-print(f"training epochs: {max_epochs}\n")
+print("Sanity")
+print(f"network: Douwe's improved UNet, kernel_size: {KERNEL_SIZE}")
+print(f"scale in training set: {TRAIN_SCALE}; scale in validation set: {VAL_SCALE}")
+print(f"learning rate: {LR}; learning rate scheduler: {LR_SCHEDULER}")
+print(f"training epochs: {MAX_EPOCHS}\n")
 
 ###################
 ##   Functions   ##
@@ -82,25 +82,44 @@ def write_csv(dictionary, save_dir):
 
     print(f"{save_dir} created")
 
-def find_first_slice_with_label(data, label=1):
+def find_first_and_last_slice_with_label(data, label=1):
+    first_slice = None
+    last_slice = None
     slices = data.shape[-1]
+    
     for i in range(slices):
         if label in data[..., i]:
-            return i
-    return None
+            if first_slice is None:
+                first_slice = i  # Found the first slice with the label
+            last_slice = i  # Update last slice with the label at each find
+    
+    if first_slice is not None:
+        return [first_slice, last_slice]
+    else:
+        raise ValueError("")  # Return None if the label is not found in any slice
+
+
 def check_output(outputs, data, save_dir):
+    '''
+    Plot the middle slice of the segmentation and save figure.
+    
+    Args:
+        outputs: prediction from model
+        data: (image, segmentaion) from dataloader, should be in a list or tuple.
+    '''
     image = data[0].cpu()
     seg = data[1].cpu()
     
-    first_slice_index = find_first_slice_with_label(seg)
+    first_and_last_slice = find_first_and_last_slice_with_label(seg)
+    middle_slice = round(sum(first_and_last_slice) / len(first_and_last_slice))
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].set_title(f"Image slice {first_slice_index}")
-    axes[0].imshow(image[0, 0, :, :, first_slice_index], cmap="gray")
-    axes[1].set_title(f"Mask slice {first_slice_index}")
-    axes[1].imshow(seg[0, 0, :, :, first_slice_index])
-    axes[2].set_title(f"Output slice {first_slice_index}")
-    axes[2].imshow(torch.argmax(outputs, dim=1).detach().cpu()[0, :, :, first_slice_index])
+    axes[0].set_title(f"Image slice {middle_slice}")
+    axes[0].imshow(image[0, 0, :, :, middle_slice], cmap="gray")
+    axes[1].set_title(f"Mask slice {middle_slice}")
+    axes[1].imshow(seg[0, 0, :, :, middle_slice])
+    axes[2].set_title(f"Output slice {middle_slice}")
+    axes[2].imshow(torch.argmax(outputs, dim=1).detach().cpu()[0, :, :, middle_slice])
     plt.tight_layout()
     plt.savefig(save_dir)
     plt.close(fig)
@@ -112,7 +131,7 @@ def main():
     ##      Setup     ##
     ####################
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    attempt = datetime.now().strftime("%Y-%m-%d-%H:%M")
+    attempt = datetime.now().strftime("%Y-%m-%d-%H%M%S")
     set_determinism(seed=0)
 
     script_dir = os.getcwd()
@@ -143,8 +162,9 @@ def main():
     segs = sorted(glob.glob(os.path.join(seg3D_dir, "*.nii.gz")))
     
     #test
-    # images = images[:3]
-    # segs = segs[:3]
+    if TEST_MODE:
+        images = images[:3]
+        segs = segs[:3]
     
     data_dicts = [{"image": image, "seg": seg} for image, seg in zip(images, segs)]
 
@@ -157,64 +177,10 @@ def main():
     ####################
     ##   Transforms   ##
     ####################
-    train_transforms = Compose(
-        [
-            LoadImaged(keys=["image", "seg"]),
-            EnsureChannelFirstd(keys=["image", "seg"]),
-            NormalizeIntensityd(keys=["image"], channel_wise=True),
-            CropForegroundd(keys=["image", "seg"], source_key="image"),
-            Orientationd(keys=["image", "seg"], axcodes="RAS"),
-            
-            # Data augmentation
-            RandRotated(
-                keys=["image", "seg"],
-                range_x=180,
-                range_y=180,
-                mode=("bilinear", "nearest"),
-                align_corners=(True, None),
-                prob=0.2,
-            ),
-            RandZoomd(
-                keys=["image", "seg"],
-                min_zoom=0.7,
-                max_zoom=1.4,
-                mode=("trilinear", "nearest"),
-                align_corners=(True, None),
-                prob=0.2,
-            ),
-            RandGaussianNoised(keys=["image"], std=0.01, prob=0.15),
-            RandGaussianSmoothd(
-                keys=["image"],
-                sigma_x=(0.5, 1.5),
-                sigma_y=(0.5, 1.5),
-                sigma_z=(0.5, 1.5),
-                prob=0.2,
-            ),
-            RandScaleIntensityd(keys=["image"], factors=0.3, prob=0.15),
-            RandAdjustContrastd(keys=["image"], gamma=(0.65, 1.5), prob=0.15),
-            RandFlipd(
-                keys=["image", "seg"], spatial_axis=[0], prob=0.5
-            ),
-            RandFlipd(
-                keys=["image", "seg"], spatial_axis=[1], prob=0.5
-            ),
-            RandFlipd(
-                keys=["image", "seg"], spatial_axis=[2], prob=0.5
-            ),
-            ToTensord(keys=["image", "seg"])
-        ]
-    )
-    val_transforms = Compose(
-        [
-            LoadImaged(keys=["image", "seg"]),
-            EnsureChannelFirstd(keys=["image", "seg"]),
-            NormalizeIntensityd(keys=["image"], channel_wise=True),
-            CropForegroundd(keys=["image", "seg"], source_key="image"),
-            Orientationd(keys=["image", "seg"], axcodes="RAS"),
-        ]
-    )
-    post_pred = Compose([AsDiscrete(argmax=True, to_onehot=2)])
-    post_label = Compose([AsDiscrete(to_onehot=2)])
+    train_transforms = training_transforms(seed=0)
+    val_transforms = training_transforms(validation=True)
+    post_pred = post_transfroms()
+    post_label = post_transfroms(label=True)
     
     ####################
     ##   Dataloader   ##
@@ -230,15 +196,15 @@ def main():
     ##   Model   ##
     ###############
     model = UNet(
-    spatial_dims=3,
-    in_channels=1,
-    out_channels=2,
-    strides=(1, 1, 1),
-    kernel_size = (3, 3, 3),
-    upsample_kernel_size = (1, 1, 1),
-    activation = 'LRELU',
-    normalisation = 'instance'
-    ).to(device)
+        spatial_dims=3,
+        in_channels=1,
+        out_channels=2,
+        strides=(1,)*(len(KERNEL_SIZE)),
+        kernel_size = KERNEL_SIZE,
+        upsample_kernel_size = (1,)*(len(KERNEL_SIZE)),
+        activation = 'LRELU',
+        normalisation = 'instance'
+        ).to(device)
     
     ema = EMA(
         model,
@@ -249,9 +215,10 @@ def main():
     ema.update()
     
     loss_function = DiceLoss(to_onehot_y=True, softmax=True)
-    optimizer = torch.optim.Adam(model.parameters(), 1e-4)
-    if lr_scheduler:
-        scheduler = StepLR(optimizer, step_size=20, gamma=0.1)
+    optimizer = torch.optim.Adam(model.parameters(), LR)
+    if LR_SCHEDULER:
+        lambda_poly = lambda epoch: (1 - epoch / MAX_EPOCHS) ** 0.9
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda_poly)
     dice_metric = DiceMetric(include_background=False, reduction="mean")
     
 
@@ -265,32 +232,33 @@ def main():
     best_metric_epoch = -1
     history = {'train_epoch_loss': [],
         'val_epoch_loss': [],
-        'metric_values': []
+        'train_metric_values': [],
+        'val_metric_values': []
     }
     
     start_time = time.time()
-    for epoch in range(max_epochs):
+    for epoch in range(MAX_EPOCHS):
         print("-" * 10)
-        print(f"epoch {epoch + 1}/{max_epochs}")
+        print(f"epoch {epoch + 1}/{MAX_EPOCHS}")
         model.train()
         epoch_loss = 0
         step = 0
         epoch_start_time = time.time()
-        for batch_data in train_loader:
+        for x, train_data in enumerate(train_loader):
             step += 1
             image, seg = (
-                batch_data["image"].to(device),
-                batch_data["seg"].to(device),
+                train_data["image"].to(device),
+                train_data["seg"].to(device),
             )
             
-            if train_scale < 1:
+            if TRAIN_SCALE < 1:
                 image = F.interpolate(image[:,1:2,:,:,:], 
-                                         scale_factor = train_scale, 
+                                         scale_factor = TRAIN_SCALE, 
                                          align_corners = True, 
                                          mode = 'trilinear', 
                                          recompute_scale_factor = False)
                 seg = F.interpolate(seg.to(torch.float32), 
-                                       scale_factor = train_scale, 
+                                       scale_factor = TRAIN_SCALE, 
                                        mode ='nearest', 
                                        recompute_scale_factor = False)
             else:
@@ -299,62 +267,90 @@ def main():
                 
             optimizer.zero_grad()
             outputs = model(image)
+            
+            # plot to check the output
+            if (epoch + 1) % CHECK_INTERVAL == 0:
+                check_dir = os.path.join(model_dir, 'train_check')
+                if not os.path.exists(check_dir):
+                    print("Create 'train_check' folder for validation output.")
+                    os.makedirs(check_dir, exist_ok=True)
+                save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{x+1}.png")
+                check_output(outputs = outputs, 
+                            data = (image, seg), 
+                            save_dir = save_dir)
+            
+            # check dice metric
+            post_tr_outputs = [post_pred(i) for i in decollate_batch(outputs)]
+            post_tr_seg = [post_label(i) for i in decollate_batch(seg)]
+            dice_metric(y_pred=post_tr_outputs, y=post_tr_seg)
+            
             loss = loss_function(outputs, seg)
             loss.backward()
             optimizer.step()
             ema.update()
-            if lr_scheduler:
-                scheduler.step()
             epoch_loss += loss.item()
             print(f"{step}/{len(train_ds) // train_loader.batch_size}, " f"train_loss: {loss.item():.4f}")
+        if LR_SCHEDULER:
+            scheduler.step()
+            for param_group in optimizer.param_groups:
+                current_lr = param_group['lr']
+                print(f"Current Learning Rate: {current_lr}")
+        
         epoch_loss /= step
+        metric = dice_metric.aggregate().item() # aggregate the final mean dice result
+        dice_metric.reset()
         history['train_epoch_loss'].append(epoch_loss)
+        history['train_metric_values'].append(metric)
         print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
         print(f"-- {(time.time()-epoch_start_time):.4f} seconds --")
 
-        if (epoch + 1) % val_interval == 0:
+        if (epoch + 1) % VAL_INTERVAL == 0:
             model.eval()
             val_epoch_loss = 0
             val_step = 0
             with torch.no_grad():
-                for i, val_data in enumerate(val_loader):
+                for y, val_data in enumerate(val_loader):
                     val_step += 1
                     val_image, val_seg = (
                         val_data["image"].to(device),
                         val_data["seg"].to(device),
                     )
                     
-                    if val_scale < 1:
+                    if VAL_SCALE < 1:
                         val_image = F.interpolate(val_image[:,1:2,:,:,:], 
-                                                scale_factor = val_scale, 
+                                                scale_factor = VAL_SCALE, 
                                                 align_corners = True, 
                                                 mode = 'trilinear', 
                                                 recompute_scale_factor = False)
                         val_seg = F.interpolate(val_seg.to(torch.float32), 
-                                            scale_factor = val_scale, 
+                                            scale_factor = VAL_SCALE, 
                                             mode ='nearest', 
                                             recompute_scale_factor = False)
                     else:
                         val_image = val_image[:,1:2,:,:,:]
                         val_seg = val_seg
-                    roi_size = (50,50,50)
-                    sw_batch_size = 1
-                    # val_outputs = sliding_window_inference(val_image, roi_size, sw_batch_size, model)
-                    val_outputs = sliding_window_inference(val_image, roi_size, sw_batch_size, ema)
+                    
+                    if SLIDING_WINDOW:
+                        roi_size = (50,50,50)
+                        sw_batch_size = 1
+                        val_outputs = sliding_window_inference(val_image, roi_size, sw_batch_size, ema)
+                    else:
+                        val_outputs = ema(val_image)
+                    
+                    # plot to check the output
+                    if (epoch + 1) % CHECK_INTERVAL == 0:
+                        check_dir = os.path.join(model_dir, 'val_check')
+                        if not os.path.exists(check_dir):
+                            print("Create 'check' folder for validation output.")
+                            os.makedirs(check_dir, exist_ok=True)
+                        save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{y+1}.png")
+                        check_output(outputs = val_outputs, 
+                                    data = (val_image, val_seg), 
+                                    save_dir = save_dir)
                     
                     # save the loss
                     val_loss = loss_function(val_outputs, val_seg)
                     val_epoch_loss += val_loss.item()
-                    
-                    # plot to check the output
-                    check_dir = os.path.join(model_dir, 'check')
-                    if not os.path.exists(check_dir):
-                        print("Create 'check' folder for validation output.")
-                        os.makedirs(check_dir, exist_ok=True)
-                    save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{i+1}.png")
-                    check_output(outputs = val_outputs, 
-                                 data = (val_image, val_seg), 
-                                 save_dir = save_dir)
                     
                     # check dice metric
                     post_val_outputs = [post_pred(i) for i in decollate_batch(val_outputs)]
@@ -366,7 +362,7 @@ def main():
                 dice_metric.reset() # reset the status for next validation round
                 
                 history['val_epoch_loss'].append(val_epoch_loss)
-                history['metric_values'].append(metric)
+                history['val_metric_values'].append(metric)
                 
                 if metric > best_metric:
                     best_metric = metric
@@ -401,10 +397,13 @@ def main():
     axes[0].plot(x, y_val, label='val')
     axes[0].legend()
     axes[1].set_title("Val Mean Dice")
-    x = [val_interval * (i + 1) for i in range(len(history['metric_values']))]
-    y = history['metric_values']
+    x = [VAL_INTERVAL * (i + 1) for i in range(len(history['train_metric_values']))]
+    y_tr = history['train_metric_values']
+    y_val = history['val_metric_values']
     axes[1].set_xlabel("Epoch")
-    axes[1].plot(x, y)
+    axes[1].plot(x, y_tr, label='train')
+    axes[1].plot(x, y_val, label='val')
+    axes[1].legend()
     plt.tight_layout()
     plt.savefig(os.path.join(model_dir, 'loss_metric.png'))
     plt.close(fig)
