@@ -20,109 +20,40 @@ from monai.data import CacheDataset, DataLoader, decollate_batch
 from monai.utils import set_determinism
 from transforms.set_transforms import training_transforms, post_transfroms
 
-# from monai.networks.nets import UNet
 from model.douwe_unet import UNet
+from model.monai_unet import MOANI_UNet
+from model.groupreg_unet import GroupReg_UNet
 from monai.losses import DiceLoss
 from monai.metrics import DiceMetric
 from monai.inferers import sliding_window_inference
 from torch.optim.lr_scheduler import LambdaLR
 from ema_pytorch import EMA
+from model.utils import Sanity_check, write_csv
 
 ####################
 ##   Settings     ##
 ####################
-TRAIN_SCALE = 0.5
-VAL_SCALE = 0.5
+TEST_MODE = False # use only a small part of data
+MODEL = "Douwe" # Douwe / MONAI / GroupReg
+MAX_EPOCHS = 1000
 LR = 0.01
 LR_SCHEDULER = True
-MAX_EPOCHS = 1000
 KERNEL_SIZE = (3, 3, 3)
-VAL_INTERVAL = 1 # always set to 1 to avoid some issue in plotting
-CHECK_INTERVAL = 20
-SLIDING_WINDOW = False
-TEST_MODE = False # use only a small part of data
+ACCUMULATE_GRAD_BATCHES = 1
 
+TRAIN_SCALE = 0.5
+VAL_SCALE = 0.5
+VAL_INTERVAL = 1 # always set to 1 to avoid some issue in plotting
+CHECK_INTERVAL = 50
+SLIDING_WINDOW = False
 
 print("##############")
 print("## Settings ##")
 print("##############")
-print("Sanity")
-print(f"network: Douwe's improved UNet, kernel_size: {KERNEL_SIZE}")
+print(f"network: {MODEL}; kernel_size: {KERNEL_SIZE}")
 print(f"scale in training set: {TRAIN_SCALE}; scale in validation set: {VAL_SCALE}")
 print(f"learning rate: {LR}; learning rate scheduler: {LR_SCHEDULER}")
-print(f"training epochs: {MAX_EPOCHS}\n")
-
-###################
-##   Functions   ##
-###################
-def write_csv(dictionary, save_dir):
-    '''
-    Args:
-        dictionary: a dictionary containing the loss and metric values
-        save_dir: directory to save the CSV file
-    '''
-    with open(save_dir, 'w', newline='') as file:
-        writer = csv.writer(file)
-        # Find the maximum length of the data to set the number of epochs
-        max_length = max(len(v) for v in dictionary.values())
-        # Write the header
-        writer.writerow(['Epoch'] + list(dictionary.keys()))
-
-        # Write data for each epoch
-        for i in range(max_length):
-            row = [i + 1]  # Epoch number
-            for key in dictionary.keys():
-                try:
-                    # Try to add the value for this epoch, if it exists
-                    row.append(dictionary[key][i])
-                except IndexError:
-                    # If the value doesn't exist for this metric at this epoch, add a blank
-                    row.append('')
-            writer.writerow(row)
-
-    print(f"{save_dir} created")
-
-def find_first_and_last_slice_with_label(data, label=1):
-    first_slice = None
-    last_slice = None
-    slices = data.shape[-1]
-    
-    for i in range(slices):
-        if label in data[..., i]:
-            if first_slice is None:
-                first_slice = i  # Found the first slice with the label
-            last_slice = i  # Update last slice with the label at each find
-    
-    if first_slice is not None:
-        return [first_slice, last_slice]
-    else:
-        raise ValueError("")  # Return None if the label is not found in any slice
-
-
-def check_output(outputs, data, save_dir):
-    '''
-    Plot the middle slice of the segmentation and save figure.
-    
-    Args:
-        outputs: prediction from model
-        data: (image, segmentaion) from dataloader, should be in a list or tuple.
-    '''
-    image = data[0].cpu()
-    seg = data[1].cpu()
-    
-    first_and_last_slice = find_first_and_last_slice_with_label(seg)
-    middle_slice = round(sum(first_and_last_slice) / len(first_and_last_slice))
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].set_title(f"Image slice {middle_slice}")
-    axes[0].imshow(image[0, 0, :, :, middle_slice], cmap="gray")
-    axes[1].set_title(f"Mask slice {middle_slice}")
-    axes[1].imshow(seg[0, 0, :, :, middle_slice])
-    axes[2].set_title(f"Output slice {middle_slice}")
-    axes[2].imshow(torch.argmax(outputs, dim=1).detach().cpu()[0, :, :, middle_slice])
-    plt.tight_layout()
-    plt.savefig(save_dir)
-    plt.close(fig)
+print(f"training epochs: {MAX_EPOCHS}; accumulate grad batch: {ACCUMULATE_GRAD_BATCHES}\n")
 
 ################################## MAIN ##################################
 def main():
@@ -133,16 +64,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     attempt = datetime.now().strftime("%Y-%m-%d-%H%M%S")
     set_determinism(seed=0)
-
-    script_dir = os.getcwd()
-    model_folder = os.path.join(script_dir, "..", "data", "BLT_radiomics", "u-net")
-    model_dir = os.path.join(model_folder, attempt)
-    if not os.path.exists(model_dir):
-        os.makedirs(model_dir, exist_ok=True)
     
-    print(f"Device: {device}")
-    print(f"The results will be saved at: {model_dir}")
-
+    script_dir = os.getcwd()
     if 'r098906' in script_dir:
         GPU_cluster = True
     else:
@@ -151,10 +74,19 @@ def main():
     if GPU_cluster:
         img4D_dir = "/data/scratch/r098906/BLT_radiomics/4D_resampled_images_newseg"
         seg3D_dir = "/data/scratch/r098906/BLT_radiomics/segs_new_resampled"
+        model_folder = os.path.join(script_dir, "..", "BLT", "data", "BLT_radiomics", "segnet")
     else:
         img4D_dir = "c:/Users/Yin/Desktop/Vrije_courses/internship/codes/data/BLT_radiomics/image_files/4D_resampled_images_newseg"
         seg3D_dir = "c:/Users/Yin/Desktop/Vrije_courses/internship/codes/data/BLT_radiomics/image_files/segs_new_resampled"
-
+        model_folder = os.path.join(script_dir, "..", "data", "BLT_radiomics", "segnet")
+    
+    model_dir = os.path.join(model_folder, attempt)
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir, exist_ok=True)
+    
+    print(f"GPU cluster: {GPU_cluster}; Device: {device}")
+    print(f"The results will be saved at: {model_dir}")
+    
     ####################
     ### Load data
     # images and segmentations
@@ -195,16 +127,39 @@ def main():
     ###############
     ##   Model   ##
     ###############
-    model = UNet(
-        spatial_dims=3,
-        in_channels=1,
-        out_channels=2,
-        strides=(1,)*(len(KERNEL_SIZE)),
-        kernel_size = KERNEL_SIZE,
-        upsample_kernel_size = (1,)*(len(KERNEL_SIZE)),
-        activation = 'LRELU',
-        normalisation = 'instance'
-        ).to(device)
+    
+    if MODEL == "Douwe":
+        model = UNet(
+            spatial_dims=3,
+            in_channels=1,
+            out_channels=2,
+            strides=(1,)*(len(KERNEL_SIZE)),
+            kernel_size = KERNEL_SIZE,
+            upsample_kernel_size = (1,)*(len(KERNEL_SIZE)),
+            activation = 'LRELU',
+            normalisation = 'instance'
+            ).to(device)
+    elif MODEL == "MONAI":
+        model = MOANI_UNet(
+            spatial_dims=3,
+            in_channels=1,
+            out_channels=2,
+            channels=(32, 64, 128),
+            strides=(1,1,1),
+            num_res_units=0,
+            norm='instance'
+            ).to(device)
+    elif MODEL == "GroupReg":
+        model = GroupReg_UNet(
+            in_channels = 1, 
+            out_channels = 2, 
+            dim = 3, 
+            depth = 3, 
+            initial_channels = 32, 
+            normalization = True
+            ).to(device)
+    else:
+        raise ValueError("The model only supports the following options: 'Douwe', 'MONAI', or 'GroupReg'.")
     
     ema = EMA(
         model,
@@ -268,26 +223,32 @@ def main():
             optimizer.zero_grad()
             outputs = model(image)
             
-            # plot to check the output
+            # dice metric
+            post_tr_outputs = [post_pred(i) for i in decollate_batch(outputs)]
+            post_tr_seg = [post_label(i) for i in decollate_batch(seg)]
+            dice_metric(y_pred=post_tr_outputs, y=post_tr_seg)
+            
+            # loss
+            loss = loss_function(outputs, seg)
+            loss.backward()
+            
+            # sanity check
             if (epoch + 1) % CHECK_INTERVAL == 0:
                 check_dir = os.path.join(model_dir, 'train_check')
                 if not os.path.exists(check_dir):
                     print("Create 'train_check' folder for validation output.")
                     os.makedirs(check_dir, exist_ok=True)
                 save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{x+1}.png")
-                check_output(outputs = outputs, 
-                            data = (image, seg), 
-                            save_dir = save_dir)
+                Sanity_check.check_seg(outputs = outputs, 
+                                        data = (image, seg), 
+                                        save_dir = save_dir)
             
-            # check dice metric
-            post_tr_outputs = [post_pred(i) for i in decollate_batch(outputs)]
-            post_tr_seg = [post_label(i) for i in decollate_batch(seg)]
-            dice_metric(y_pred=post_tr_outputs, y=post_tr_seg)
+            # update weight & gradient accumulation
+            if (step + 1) % ACCUMULATE_GRAD_BATCHES == 0:
+                optimizer.step()
+                ema.update()
+                print("optimizer update!")
             
-            loss = loss_function(outputs, seg)
-            loss.backward()
-            optimizer.step()
-            ema.update()
             epoch_loss += loss.item()
             print(f"{step}/{len(train_ds) // train_loader.batch_size}, " f"train_loss: {loss.item():.4f}")
         if LR_SCHEDULER:
@@ -330,6 +291,7 @@ def main():
                         val_image = val_image[:,1:2,:,:,:]
                         val_seg = val_seg
                     
+                    # Sliding window inference
                     if SLIDING_WINDOW:
                         roi_size = (50,50,50)
                         sw_batch_size = 1
@@ -337,26 +299,26 @@ def main():
                     else:
                         val_outputs = ema(val_image)
                     
-                    # plot to check the output
+                    # metric
+                    post_val_outputs = [post_pred(i) for i in decollate_batch(val_outputs)]
+                    post_val_seg = [post_label(i) for i in decollate_batch(val_seg)]
+                    dice_metric(y_pred=post_val_outputs, y=post_val_seg)
+                    
+                    # loss
+                    val_loss = loss_function(val_outputs, val_seg)
+                    val_epoch_loss += val_loss.item()
+                    
+                    # Sanity check
                     if (epoch + 1) % CHECK_INTERVAL == 0:
                         check_dir = os.path.join(model_dir, 'val_check')
                         if not os.path.exists(check_dir):
                             print("Create 'check' folder for validation output.")
                             os.makedirs(check_dir, exist_ok=True)
                         save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{y+1}.png")
-                        check_output(outputs = val_outputs, 
-                                    data = (val_image, val_seg), 
-                                    save_dir = save_dir)
+                        Sanity_check.check_seg(outputs = val_outputs, 
+                                                data = (val_image, val_seg), 
+                                                save_dir = save_dir)
                     
-                    # save the loss
-                    val_loss = loss_function(val_outputs, val_seg)
-                    val_epoch_loss += val_loss.item()
-                    
-                    # check dice metric
-                    post_val_outputs = [post_pred(i) for i in decollate_batch(val_outputs)]
-                    post_val_seg = [post_label(i) for i in decollate_batch(val_seg)]
-                    dice_metric(y_pred=post_val_outputs, y=post_val_seg)
-
                 val_epoch_loss /= val_step
                 metric = dice_metric.aggregate().item() # aggregate the final mean dice result
                 dice_metric.reset() # reset the status for next validation round
@@ -383,9 +345,9 @@ def main():
     save_dir = os.path.join(model_dir, 'training_log.csv')
     write_csv(history, save_dir)
     
-    ##################
-    ##   Plotting   ##
-    ##################
+    ###################
+    ##   Plot loss   ##
+    ###################
     # Plot the loss and metric
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     axes[0].set_title("Epoch Average Loss")
