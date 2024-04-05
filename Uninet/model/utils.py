@@ -2,7 +2,7 @@
 import csv
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt; dpi=300
 from matplotlib.patches import Patch
 
 
@@ -98,37 +98,6 @@ class Struct:
     def __init__(self, **entries):
         self.__dict__.update(entries)
 
-
-###################
-##   Functions   ##
-###################
-def write_csv(dictionary, save_dir):
-    '''
-    Args:
-        dictionary: a dictionary containing the loss and metric values
-        save_dir: directory to save the CSV file
-    '''
-    with open(save_dir, 'w', newline='') as file:
-        writer = csv.writer(file)
-        # Find the maximum length of the data to set the number of epochs
-        max_length = max(len(v) for v in dictionary.values())
-        # Write the header
-        writer.writerow(['Epoch'] + list(dictionary.keys()))
-
-        # Write data for each epoch
-        for i in range(max_length):
-            row = [i + 1]  # Epoch number
-            for key in dictionary.keys():
-                try:
-                    # Try to add the value for this epoch, if it exists
-                    row.append(dictionary[key][i])
-                except IndexError:
-                    # If the value doesn't exist for this metric at this epoch, add a blank
-                    row.append('')
-            writer.writerow(row)
-
-    print(f"{save_dir} created")
-
 class Sanity_check():
     def __init__(self, outputs, data, save_dir):
         self.outputs = outputs.cpu().detach().numpy()
@@ -207,3 +176,75 @@ class Sanity_check():
     def check_seg(cls, outputs, data, save_dir):
         instance = cls(outputs, data, save_dir)
         instance.seg_plots()
+        
+        
+###################
+##   Functions   ##
+###################
+def write_csv(dictionary, save_dir):
+    '''
+    Args:
+        dictionary: a dictionary containing the loss and metric values
+        save_dir: directory to save the CSV file
+    '''
+    with open(save_dir, 'w', newline='') as file:
+        writer = csv.writer(file)
+        # Find the maximum length of the data to set the number of epochs
+        max_length = max(len(v) for v in dictionary.values())
+        # Write the header
+        writer.writerow(['Epoch'] + list(dictionary.keys()))
+
+        # Write data for each epoch
+        for i in range(max_length):
+            row = [i + 1]  # Epoch number
+            for key in dictionary.keys():
+                try:
+                    # Try to add the value for this epoch, if it exists
+                    row.append(dictionary[key][i])
+                except IndexError:
+                    # If the value doesn't exist for this metric at this epoch, add a blank
+                    row.append('')
+            writer.writerow(row)
+
+    print(f"{save_dir} created")
+
+
+def get_mean_std(list_w_dicts, metric):
+    metric_values = [fold[metric] for fold in list_w_dicts]
+    metric_values = list(zip(*metric_values))
+
+    means = [np.mean(epoch) for epoch in metric_values]
+    stds = [np.std(epoch) for epoch in metric_values]
+    return means, stds
+
+def plot_cv(history_CV, save_dir):
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    tr_epoch_loss_m, tr_epoch_loss_std = get_mean_std(history_CV, metric="train_epoch_loss")
+    v_epoch_loss_m, v_epoch_loss_std = get_mean_std(history_CV, metric='val_epoch_loss')
+    tr_epochs = range(1, len(tr_epoch_loss_m) + 1)
+    v_epochs = range(1, len(v_epoch_loss_m) + 1)
+    axes[0].plot(tr_epochs, tr_epoch_loss_m, label=f'train')
+    axes[0].plot(v_epochs, v_epoch_loss_m, label=f'val')
+    axes[0].fill_between(tr_epochs, np.array(tr_epoch_loss_m)-np.array(tr_epoch_loss_std), np.array(tr_epoch_loss_m)+np.array(tr_epoch_loss_std), alpha=0.3)
+    axes[0].fill_between(v_epochs, np.array(v_epoch_loss_m)-np.array(v_epoch_loss_std), np.array(v_epoch_loss_m)+np.array(v_epoch_loss_std), alpha=0.3)
+    axes[0].legend()
+    axes[0].set_title("Epoch Average Loss")
+    axes[0].set_xlabel("epoch")
+
+    tr_metric_m, tr_metric_sd = get_mean_std(history_CV, metric="train_metric_values")
+    v_metric_m, v_metric_sd = get_mean_std(history_CV, metric='val_metric_values')
+    tr_epochs = range(1, len(tr_metric_m) + 1)
+    v_epochs = range(1, len(v_metric_m) + 1)
+    axes[1].plot(tr_epochs, tr_metric_m, label=f'train')
+    axes[1].plot(v_epochs, v_metric_m, label=f'val')
+    axes[1].fill_between(tr_epochs, np.array(tr_metric_m) - np.array(tr_metric_sd), np.array(tr_metric_m) + np.array(tr_metric_sd), alpha=0.3)
+    axes[1].fill_between(v_epochs, np.array(v_metric_m) - np.array(v_metric_sd), np.array(v_metric_m) + np.array(v_metric_sd), alpha=0.3)
+    axes[1].legend()
+    axes[1].set_title("Val Mean Dice")
+    axes[1].set_xlabel("epoch")
+    
+    plt.savefig(save_dir)
+    plt.close(fig)
+    
