@@ -10,89 +10,50 @@ class UNet(nn.Module):
     UNet. 
     Adapted from: https://github.com/Douwe-Spaanderman/InteractiveNet/blob/main/interactivenet/networks/unet.py
 
-    Parameters
-    ----------
-    spatial_dims: int
-        number of dims in the input tensor. Currently only 3 is possible.
+    Parameters:
     in_channels: int
-        number of channels in the input tensor.
-    out_channels: int
-        the number of features in the output segmentation or
-        size of feature space for barlow twins.
+        Number of channels in the input tensor.
+    out_channels: tuple
+        Tuple of the number of output channels for each decoder.
     kernel_size: list of tuples or int
         kernel_sizes for each layer. Also determines number of layer
     strides: list of tuples or int
         strides for each layer.
     upsample_kernel_size: list of tuples or int
         upsample_kernel_size for each layer stride[1:].
-    activation: 'str', default 'LRELU'
-        can also provide PRELU and RELU instead.
-    normalisation: 'str', default 'instance'
-        can also provide batch normalisation instead.
-    deep_supervision: bool, default True
-        if you wish to apply deep supervision. At this time will happen at all feature spaces.
+    filters: list, optional
+        Specifies the number of filters for each layer.
+    activation: str
+        Type of activation to use.
+    normalisation: str
+        Type of normalisation (instance or batch).
     '''
-
     def __init__(
         self,
-        spatial_dims: int,
         in_channels: int,
-        out_channels_reg: int,
-        out_channels_seg: int,
+        out_channels: tuple,
         kernel_size: Sequence[Union[Sequence[int], int]],
         strides: Sequence[Union[Sequence[int], int]],
         upsample_kernel_size: Sequence[Union[Sequence[int], int]],
         filters: Optional[Sequence[int]] = None,
         activation: str = "LRELU",
         normalisation: str = "instance",
-        deep_supervision: bool = False,
     ):
-        super().__init__()
-
-        if spatial_dims != 3:
-            raise KeyError("Currently only 3 possible.")
-        if normalisation == "batch":
-            Norm = nn.BatchNorm3d
-        elif normalisation == "instance":
-            Norm = nn.InstanceNorm3d
-        else:
-            raise KeyError(
-                f"please provide batch or instance for normalisation, not {normalisation}"
-            )
-
-        if activation == "PRELU":
-            Act = nn.PReLU
-        elif activation == "LRELU":
-            Act = nn.LeakyReLU
-        elif activation == "RELU":
-            Act = nn.ReLU
-        else:
-            raise KeyError(
-                f"please provide batch or instance for normalisation, not {normalisation}"
-            )
-
-        #################
-        ## Add decoder ##
-        #################
-        self.out_channels_reg = out_channels_reg # changed
-        self.out_channels_seg = out_channels_seg # changed
+        super(UNet, self).__init__()
         
+        self.name = "UNet"
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.strides = strides
-        if filters == None:
-            self.filters = (32, 64, 128, 256, 320, 320, 320, 320)[
-                : len(self.kernel_size)
-            ]
-        else:
-            self.filters = filters
         self.upsample_kernel_size = upsample_kernel_size[::-1]
-        self.in_channels = in_channels
-        self.deep_supervision = deep_supervision
-        self.down = []
-        self.up = []
-        self.deepsupervision = []
-        self.name = "UNet"
-
+        self.filters = filters if filters else [32, 64, 128, 256, 512][:len(kernel_size)]
+        Act = nn.LeakyReLU if activation == "LRELU" else (nn.ReLU if activation == "RELU" else nn.PReLU)
+        Norm = nn.InstanceNorm3d if normalisation == "instance" else nn.BatchNorm3d
+     
+        # Encoder
+        self.input_block = nn.ModuleList()
+        self.encoders = nn.ModuleList()
         for i, kernel in enumerate(self.kernel_size):
             in_channels = self.in_channels if i == 0 else out_channels
             out_channels = self.filters[i]
@@ -107,7 +68,7 @@ class UNet(nn.Module):
                     Activation=Act,
                 )
             elif i < len(self.kernel_size) - 1:
-                self.down.append(
+                self.encoders.append(
                     DoubleConv(
                         in_channels=in_channels,
                         out_channels=out_channels,
@@ -118,7 +79,7 @@ class UNet(nn.Module):
                     )
                 )
             else:
-                self.down = nn.ModuleList(self.down)
+                self.encoders = nn.ModuleList(self.encoders)
                 self.bottleneck = DoubleConv(
                     in_channels=in_channels,
                     out_channels=out_channels,
@@ -127,52 +88,59 @@ class UNet(nn.Module):
                     Norm=Norm,
                     Activation=Act,
                 )
-
-        for i, kernel in enumerate(self.kernel_size[::-1][1:]):
-            in_channels = out_channels
-            out_channels = self.filters[::-1][1:][i]
-            self.up.append(
+        
+        # Decoders
+        self.decoders1 = nn.ModuleList()
+        self.decoders2 = nn.ModuleList()
+        for i in range(len(self.filters)-1, 0, -1):
+            self.decoders1.append(
                 Up(
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    kernel_size=kernel,
-                    # stride=self.strides[::-1][i],
-                    upsample_kernel_size=self.upsample_kernel_size[i],
-                    Norm=Norm,
-                )
+                in_channels=self.filters[i], 
+                out_channels=self.filters[i-1], 
+                kernel_size=kernel_size[i-1], 
+                upsample_kernel_size=upsample_kernel_size[i], 
+                Norm=Norm)
+            )
+            self.decoders2.append(
+                Up(
+                in_channels=self.filters[i], 
+                out_channels=self.filters[i-1], 
+                kernel_size=kernel_size[i-1], 
+                upsample_kernel_size=upsample_kernel_size[i], 
+                Norm=Norm)
             )
 
-        self.up = nn.ModuleList(self.up)
+        self.final_conv1 = nn.Conv3d(self.filters[0], self.out_channels[0], 1)
+        self.final_conv2 = nn.Conv3d(self.filters[0], self.out_channels[1], 1)
         
-        #################
-        ## Add decoder ##
-        #################
-        self.finalconv_reg = nn.Conv3d(
-            out_channels, self.out_channels_reg, kernel_size=1, stride=1
-        ) # changed
-        self.finalconv_seg = nn.Conv3d(
-            out_channels, self.out_channels_seg, kernel_size=1, stride=1
-        ) # changed
-
-        if self.deep_supervision == True:
-            # Deep supervision for all but final and two lowest resolutions
-            for i, kernel in enumerate(self.kernel_size[::-1][2:-1]):
-                out_channels = self.filters[::-1][i + 2]
-                self.deepsupervision.append(
-                    nn.Conv3d(
-                        in_channels=out_channels,
-                        out_channels=2,
-                        kernel_size=1,
-                        stride=1,
-                        bias=False,
-                    )
-                )
-
-            self.deepsupervision = nn.ModuleList(self.deepsupervision)
-
-        # Weight initialization
         self.weight_initializer()
 
+    def forward(self, x):
+        x = self.input_block(x)
+        skips = [x]
+
+        for enc in self.encoders:
+            x = enc(x)
+            skips.append(x)
+
+        x = self.bottleneck(x)
+
+        x1 = x
+        x2 = x
+        for i, (dec1, dec2, skip) in enumerate(zip(self.decoders1, self.decoders2, reversed(skips))):
+            x1 = dec1(x1, skip)
+            x2 = dec2(x2, skip)
+            if i == 0:
+                # save the features from the 'i' decoder
+                # collect these features for orthogonal regularization
+                feature1 = x1  
+                feature2 = x2
+        
+        x1 = self.final_conv1(x1)
+        x2 = self.final_conv2(x2)
+
+        return x1, x2, feature1, feature2
+    
     def weight_initializer(self):
         for module in self.modules():
             if isinstance(module, nn.ConvTranspose3d) or isinstance(module, nn.Conv3d):
@@ -185,39 +153,9 @@ class UNet(nn.Module):
                 nn.init.constant_(module.weight, 1)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
-
-    def forward(self, x):
-        x = self.input_block(x)
-        skips = [x]
-
-        for module in self.down:
-            x = module(x)
-            skips.append(x)
-
-        x = self.bottleneck(x)
-
-        skips = skips[::-1]
-        supervision = []
-        for i, module in enumerate(self.up):
-            x_skip = skips[i]
-            x = module(x, x_skip)
-            if self.deepsupervision and 0 < i < len(self.up) - 1:
-                x_deep = self.deepsupervision[i - 1](x)
-                supervision.append(x_deep)
-
-        #################
-        ## Add decoder ##
-        #################
-        x_reg = self.finalconv_reg(x) # changed
-        x_seg = self.finalconv_seg(x) # changed
-
-        if supervision:
-            supervision.append(x)
-            return supervision
-
-        return x_reg, x_seg # changed
-
-
+                    
+                    
+##########################################################################
 class DoubleConv(nn.Module):
     def __init__(
         self,
@@ -230,57 +168,26 @@ class DoubleConv(nn.Module):
         Activation=nn.LeakyReLU,
     ):
         super(DoubleConv, self).__init__()
-        # Checking kernel for padding
-        if kernel_size == 3 or kernel_size == [3, 3, 3]:
-            padding = 1
-        elif kernel_size == [3, 3, 1]:
-            padding = (1, 1, 0)
-        elif kernel_size == [1, 3, 3]:
-            padding = (0, 1, 1)
-        else:
-            padding = 1
-            warnings.warn(
-                "kernel is neither 3, (3,3,3) or (1,3,3). This scenario has not been correctly implemented yet, but using padding = 1"
-            )
-
-        self.conv1 = nn.Conv3d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            bias=bias,
-        )
-        self.conv2 = nn.Conv3d(
-            out_channels,
-            out_channels,
-            kernel_size,
-            stride=1,
-            padding=padding,
-            bias=bias,
-        )
-        self.act = Activation()
-
+        padding = kernel_size // 2  # Automatic padding calculation
+        
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
         self.norm1 = Norm(out_channels, affine=True)
+        self.act1 = Activation()
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size, stride=1, padding=padding, bias=bias)
         self.norm2 = Norm(out_channels, affine=True)
+        self.act2 = Activation()
 
     def forward(self, x):
         x = self.conv1(x)
         x = self.norm1(x)
-        x = self.act(x)
-
+        x = self.act1(x)
+        
         x = self.conv2(x)
         x = self.norm2(x)
-        x = self.act(x)
+        x = self.act2(x)
         return x
 
-
 class Up(nn.Module):
-    """
-    A helper Module that performs 2 convolutions, 1 UpConvolution and a uses a skip connection.
-    A PReLU activation and optionally a BatchNorm or InstanceNorm follows each convolution.
-    """
-
     def __init__(
         self,
         in_channels,
@@ -302,10 +209,8 @@ class Up(nn.Module):
             out_channels * 2, out_channels, kernel_size, stride=1, Norm=Norm
         )
 
-    def forward(self, x, x_skip):
+    def forward(self, x, skip):
         x = self.transpconv(x)
-        # print(x.size())
-        # print(x_skip.size())
-        x = torch.cat((x_skip, x), dim=1)
+        x = torch.cat((x, skip), dim=1)  # Concatenate skip connection with upsampled output
         x = self.doubleconv(x)
         return x
