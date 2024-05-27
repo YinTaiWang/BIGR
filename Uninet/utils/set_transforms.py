@@ -8,9 +8,6 @@ from monai.transforms import (
     RandRotated, RandZoomd, RandGaussianNoised, RandGaussianSmoothd,
     RandScaleIntensityd, RandAdjustContrastd, RandFlipd, ToTensord)
 
-from Uninet.transforms.transforms import N4BiasFieldCorrectiond
-
-
 def training_transforms(seed: Optional[int] = None, validation: bool = False):
     if seed:
         set_determinism(seed=seed)
@@ -27,14 +24,6 @@ def training_transforms(seed: Optional[int] = None, validation: bool = False):
     if not validation:
         ## augmentation
         transforms += [
-            # RandRotated(
-            #     keys=["image", "seg"],
-            #     range_x=180,
-            #     range_y=180,
-            #     mode=("bilinear", "nearest"),
-            #     align_corners=(True, None),
-            #     prob=0.2,
-            # ),
             RandZoomd(
                 keys=["image", "seg"],
                 min_zoom=0.7,
@@ -63,7 +52,6 @@ def training_transforms(seed: Optional[int] = None, validation: bool = False):
                 keys=["image", "seg"], spatial_axis=[2], prob=0.5
             ),
         ]
-
 
     return Compose(transforms)
 
