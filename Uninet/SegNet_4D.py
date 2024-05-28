@@ -32,23 +32,23 @@ VALIDATE_MODEL = True # perform the validation set
 
 CONFIG = {
     # Model setup
-    'max_epochs': 2,
-    'fold': 2,
+    'max_epochs': 1000,
+    'fold': 5,
     'lr': 0.01,
     'lr_scheduler': True,
     'channels': (32, 64, 128),
+    'strides': 2,
     # Scale factor for downscaling the input images and segmentations for training.
-    'train_scale': 0.5,  
-    'val_scale': 0.5,
+    'scale': 0.5, 
     # Model stablizer
     'accumulate_grad_batches': 4,
     # weight
     'weight_s': 0.8,
     # Sanity checks
     'check_train': True,
-    'check_tr_interval': 1,
+    'check_tr_interval': 500,
     'check_val': True,
-    'check_val_interval': 1,
+    'check_val_interval': 100,
 }
 
 print("=== CONFIG ===")
@@ -74,11 +74,11 @@ def main():
         GPU_cluster = False
 
     if GPU_cluster:
-        img4D_dir = "/data/scratch/r098906/BLT_radiomics/images_preprocessed"
+        img4D_dir = "/data/scratch/r098906/BLT_radiomics/images_preprocessed_nobc"
         seg3D_dir = "/data/scratch/r098906/BLT_radiomics/segs_new_preprocessed"
         model_folder = os.path.join(script_dir, "..", "BLT", "data", "BLT_radiomics", "segnet")
     else:
-        img4D_dir = "c:/Users/Yin/Desktop/Vrije_courses/internship/codes/data/BLT_radiomics/image_files/images_preprocessed"
+        img4D_dir = "c:/Users/Yin/Desktop/Vrije_courses/internship/codes/data/BLT_radiomics/image_files/images_preprocessed_nobc"
         seg3D_dir = "c:/Users/Yin/Desktop/Vrije_courses/internship/codes/data/BLT_radiomics/image_files/segs_new_preprocessed"
         model_folder = os.path.join(script_dir, "..", "data", "BLT_radiomics", "segnet")
     
@@ -87,6 +87,9 @@ def main():
         os.makedirs(model_dir, exist_ok=True)
     
     print(f"GPU cluster: {GPU_cluster}; Device: {device}")
+    print("\nDataset:")
+    print(f"Images: {img4D_dir}")
+    print(f"Segmentations: {seg3D_dir}")
     print(f"The results will be saved at: {model_dir}")
     
     ####################
@@ -148,11 +151,12 @@ def main():
             spatial_dims = 3,
             in_channels = 4,
             out_channels = 8,
+            strides = CONFIG['strides'],
             channels = CONFIG['channels'],
             act = "LRELU",
             norm = "instance"
         ).to(device)
-        divisor = 2 ** (len(CONFIG['channels'])-1)
+        divisor = CONFIG['strides'] ** (len(CONFIG['channels'])-1)
         
         ema = EMA(
             model,
@@ -201,20 +205,24 @@ def main():
                 )
                 
                 # Data preprocess:
-                # padding to fit the unet strided conv
-                # scaling to fit the memory limit
-                padded_image = add_padding_to_divisible(image, divisor)
-                padded_seg = add_padding_to_divisible(seg, divisor)
+                # if stride = 1 -> need scaling to fit the memory limit
+                # if stride > 1 -> need padding to fit the unet strided conv
+                if CONFIG['strides'] == 1:
+                    image, seg = scale(image, seg, CONFIG['scale'])
+                elif CONFIG['strides'] > 1:
+                    image = add_padding_to_divisible(image, divisor)
+                    seg = add_padding_to_divisible(seg, divisor)
+                
                 phase = int(phase[0])
                 
                 # Model predict
-                outputs = model(padded_image) # [1, 8, *img_shape]
+                outputs = model(image) # [1, 8, *img_shape]
             
                 # Loss
                 batch_loss = 0
                 pair = outputs.shape[1]/2
                 for c_phase, c in enumerate(range(0, outputs.shape[1], 2)):
-                    phase_loss = loss_function(outputs[:,c:c+2,...], padded_seg)
+                    phase_loss = loss_function(outputs[:,c:c+2,...], seg)
                     if c_phase != phase:
                         phase_loss = phase_loss * CONFIG['weight_s']
                     batch_loss += phase_loss
@@ -236,7 +244,7 @@ def main():
                     for x in range(0, outputs.shape[1], 2)
                     for i in decollate_batch(outputs[:, x:x+2, :, :, :])
                 ]
-                post_tr_seg = [post_label(i) for i in decollate_batch(padded_seg)] * 4
+                post_tr_seg = [post_label(i) for i in decollate_batch(seg)] * 4
                 dice_metric(y_pred=post_tr_outputs, y=post_tr_seg)
                 
                 # Sanity check
@@ -249,7 +257,7 @@ def main():
                     # execute
                     save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{x+1}.png")
                     Sanity_check.check_seg4d(outputs = outputs, 
-                                            data = (padded_image, padded_seg), 
+                                            data = (image, seg), 
                                             save_dir = save_dir)
                     
                 # print
@@ -285,20 +293,22 @@ def main():
                         )
                         
                         # Data preprocess:
-                        # padding to fit the unet strided conv
-                        # scaling to fit the memory limit
-                        padded_val_image = add_padding_to_divisible(val_image, divisor)
-                        padded_val_seg = add_padding_to_divisible(val_seg, divisor)
-                        val_phase = int(val_phase[0])
+                        # if stride = 1 -> need scaling to fit the memory limit
+                        # if stride > 1 -> need padding to fit the unet strided conv
+                        if CONFIG['strides'] == 1:
+                            val_image, val_seg = scale(val_image, val_seg, CONFIG['scale'])
+                        elif CONFIG['strides'] > 1:
+                            val_image = add_padding_to_divisible(val_image, divisor)
+                            val_seg = add_padding_to_divisible(val_seg, divisor)
                         
                         # Model predict
-                        val_outputs = ema(padded_val_image)
+                        val_outputs = ema(val_image)
                         
                         # Loss
                         val_batch_loss = 0
                         val_pair = val_outputs.shape[1]/2
                         for c_phase, c in enumerate(range(0, val_outputs.shape[1], 2)):
-                            val_phase_loss = loss_function(val_outputs[:,c:c+2,...], padded_val_seg)
+                            val_phase_loss = loss_function(val_outputs[:,c:c+2,...], val_seg)
                             if c_phase != val_phase:
                                 val_phase_loss = val_phase_loss * CONFIG['weight_s']
                             val_batch_loss += val_phase_loss
@@ -311,7 +321,7 @@ def main():
                             for x in range(0, val_outputs.shape[1], 2)
                             for i in decollate_batch(val_outputs[:, x:x+2, :, :, :])
                         ]
-                        post_val_seg = [post_label(i) for i in decollate_batch(padded_val_seg)] * 4
+                        post_val_seg = [post_label(i) for i in decollate_batch(val_seg)] * 4
                         dice_metric(y_pred=post_val_outputs, y=post_val_seg)
                         
                         # Sanity check
@@ -324,7 +334,7 @@ def main():
                             # execute
                             save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{y+1}.png")
                             Sanity_check.check_seg4d(outputs = val_outputs, 
-                                                    data = (padded_val_image, padded_val_seg), 
+                                                    data = (val_image, val_seg), 
                                                     save_dir = save_dir)
                     
                     val_epoch_loss /= val_step # calculate average epoch loss
@@ -344,9 +354,9 @@ def main():
                         f"Validation -- epoch {epoch + 1} average loss: {val_epoch_loss:.4f}, average dice: {metric:.4f}"
                         f"\nbest mean dice: {best_metric:.4f} at epoch: {best_metric_epoch}")
                     print(f"-- {(time.time()-epoch_start_time):.4f} seconds --")
-            if step == len(train_ds):
-                torch.save(model.state_dict(), os.path.join(model_dir, f"seg_fold{fold+1}_final.pth"))
-                print("saved the final model")
+        
+        torch.save(model.state_dict(), os.path.join(model_dir, f"seg_fold{fold+1}_final.pth"))
+        print("saved the final model")
         
         print("+"*30)
         print(f"Fold {fold+1} train completed, best_metric: {best_metric:.4f} " f"at epoch: {best_metric_epoch}")
