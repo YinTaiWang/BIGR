@@ -17,7 +17,7 @@ from monai.metrics import DiceMetric
 
 from model.unet import UNet
 from utils.functions import *
-from utils.utils import Sanity_check, write_csv, plot_cv
+from Uninet.utils.sanity_check import Sanity_check, write_csv, plot_cv
 from utils.set_transforms import training_transforms, post_transfroms
 
 from ema_pytorch import EMA
@@ -98,6 +98,7 @@ def main():
     train_transforms = training_transforms(seed=0)
     val_transforms = training_transforms(validation=True)
     post_pred = post_transfroms()
+    post_pred_fill_largest = post_transfroms(method='fillholes_and_largestcomponent')
     post_label = post_transfroms(label=True)
     
     #################
