@@ -1,39 +1,80 @@
-# GroupRegNet
-Implementation of [GroupRegNet: A Groupwise One-shot Deep Learning-based 4D Image Registration Method](https://iopscience.iop.org/article/10.1088/1361-6560/abd956). 
-Zhang, Y., Wu, X., Gach, H. M., Li, H. H., & Yang, D. (2021). GroupRegNet: a groupwise one-shot deep learning-based 4D image registration method. Physics in Medicine & Biology.
+# Project Name
 
-GroupRegNet is an unsupervised deep learning-based DIR method that employs both groupwise registration and one-shot strategy to register 4D medical images and then to determine all pairwise deformation vector fields (DVFs). 
-
-## Requirement
-
-- PyTorch
-- SimpleITK: read mhd files
-- logging and tqdm
+Joint segmentation and registration network.
 
 ## Usage
 
-To evaluate GroupRegNet with `registration_dirlab.py`, the [DIR-Lab](https://www.dir-lab.com/index.html) dataset is required. The original data needs to be converted into mhd format. 
+### Dataset Format
 
-To convert the original landmark of Landmark300 and LandmarkDense, run `convert_landmark_dirlab300.py` and `convert_landmark_dense.py`. 
+#### Supported File Formats
 
-## Overall structure
+Currently, only SimpleITKIO: `.nii.gz` is supported.
 
-![groupreg_flowchart](images/groupreg_flowchart.png)
+#### Dataset Folder Structure
 
-## Result
+The folder setup should be similar to `nnUNet`:
 
-![res_1](images/res_1.png)
+```
+root/
+├── raw_data
+├── preprocessed
+└── results
+```
+
+```
+root/raw_data/
+├── Task001_BrainTumour
+├── Task002_Heart
+├── Task003_Liver
+├── ...
+```
+
+Each file name should follow the format `Task_XXX_YYYY`, where `XXX` is the task ID and `YYYY` is the 4-digit modality/channel identifier. If only one modality/channel is available, it should still be named using the format `_0000`.
+
+For each ID, it is assumed that there is only one label available. Therefore, the file name in `labelsTr` should use the same format, with `_YYYY` indicating the modality/channel from which the label was created. 
+
+For example, if you create labels (segmentations) using specific modality/channel images for IDs `001` and `002`, then the label file names in the `labelsTr` folder should correspond to those specific modality/channel images.
 
 
-![res_2](images/res_2.png)
+```
+root/raw_data/Task003_Liver/
+├── imagesTr
+│   ├── BLT_001_0000.nii.gz
+│   ├── BLT_001_0001.nii.gz
+│   ├── BLT_001_0002.nii.gz
+│   ├── BLT_001_0003.nii.gz
+│   ├── BLT_002_0000.nii.gz
+│   ├── BLT_002_0001.nii.gz
+│   ├── BLT_002_0002.nii.gz
+│   ├── BLT_002_0003.nii.gz
+│   ├── ...
+├── imagesTs
+│   ├── BLT_485_0000.nii.gz
+│   ├── BLT_485_0001.nii.gz
+│   ├── BLT_485_0002.nii.gz
+│   ├── BLT_485_0003.nii.gz
+│   ├── BLT_486_0000.nii.gz
+│   ├── BLT_486_0001.nii.gz
+│   ├── BLT_486_0002.nii.gz
+│   ├── BLT_486_0003.nii.gz
+│   ├── ...
+└── labelsTr
+    ├── BLT_001_0001.nii.gz # label was created using image "imagesTr/BLT_001_0001.nii.gz"
+    ├── BLT_002_0003.nii.gz # label was created using image "imagesTr/BLT_002_0003.nii.gz"
+    ├── ...
+```
 
+### Preprocess
 
-![res_3](images/res_3.png)
+To preprocess the dataset, run the following Python script:
 
-Sizes, shapes, and locations of the contoured tumor targets, shown in violet shade, in coronal views of the EI phases of three patient cases.
-![res_4](images/res_4.png)
+```
+python ./preprocess/RUN.py -root ROOT_DIRECTORY -t TASK_ID --bias_correction --rigid_transformation
+```
 
-Comparison of the tracked targets in ten phases by GroupRegNet and manual contouring of case 1 and 3. The images are shown in coronal views, and the horizontal line in each figure is at the same height for visual reference.
-![res_5](images/res_5.png)
+- `-root`: The root directory where the dataset is stored.
+- `-t`: The task ID to preprocess.
+- `--bias_correction`: (Optional) Apply bias correction.
+- `--rigid_transformation`: (Optional) Apply rigid transformation.
 
-![res_6](images/res_6.png)
+The script will generate `dataset.json` and `dataset_properties.pkl` in the `raw_data` folder. The preprocessed images and segmentations will be in the `preprocessed` folder.
