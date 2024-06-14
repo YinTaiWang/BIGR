@@ -25,7 +25,7 @@ from model.douwe_unet import UNet
 from model.monai_unet import MOANI_UNet
 from model.groupreg_unet import GroupReg_UNet
 from ema_pytorch import EMA
-from model.loss import NCC, Grad
+from Uninet.loss_function.loss import NCC, Grad
 from model.spatial_transformer import SpatialTransformer
 from model.utils import Sanity_check, write_csv
 
