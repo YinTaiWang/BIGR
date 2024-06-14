@@ -8,14 +8,13 @@ import SimpleITK as sitk
 ##  Resampling  ##
 ##################
 
-def get_reference_metadata(data_dict, RawIMG_dir, RawSEG_dir):
+def get_reference_metadata(data_dict, RawIMG_dir):
     '''
     Obtain the metadata from the reference image.
     
     Args:
         data_dict: A dictionary contains data id, image, and label. Could obtain it from `dataset.json`.
         rawimg_dir: path to raw image
-        rawseg_dir: path to raw segmentation
 
     Returns:
         A dictionary contains image metadata,
@@ -34,7 +33,7 @@ def get_reference_metadata(data_dict, RawIMG_dir, RawSEG_dir):
         image_dir = os.path.join(RawIMG_dir, label)
     else:
         image_dir = os.path.join(RawIMG_dir, image[0])
-    print(image_dir)
+    # print(image_dir)
     if os.path.exists(image_dir):
         img = sitk.ReadImage(image_dir)
         ref_metadata["shape"] = img.GetSize()
@@ -53,19 +52,20 @@ def resampling(image, spacing, metadata, is_seg=False):
     
     Args:
         image: the targeted image
+        spacing: target spacing
         metadata: a dictionary contains image shape, spacing, direction, origin, and pixel value.
         is_seg: Set True if the file is segmentation (mask)
     Returns:
         Resampled image.
     '''
-    ref_spacing =  tuple(round(value, 1) for value in spacing)
-    ref_shape = list(metadata["shape"])
-    scales = [metadata["spacing"][i]/ref_spacing[i] for i in range(len(ref_spacing))]
-    scaled_shape = [round(ref_shape[i]*scales[i]) for i in range(len(ref_shape))]
+    target_spacing =  tuple(round(value, 1) for value in spacing)
+    target_shape = list(metadata["shape"])
+    scales = [metadata["spacing"][i]/target_spacing[i] for i in range(len(target_spacing))]
+    scaled_shape = [round(target_shape[i]*scales[i]) for i in range(len(target_shape))]
     scaled_shape = tuple(scaled_shape)
     
     resample = sitk.ResampleImageFilter()
-    resample.SetOutputSpacing(ref_spacing)
+    resample.SetOutputSpacing(target_spacing)
     resample.SetSize(scaled_shape)
     resample.SetOutputDirection(metadata["direction"])
     resample.SetOutputOrigin(metadata["origin"])
@@ -82,11 +82,6 @@ def resampling(image, spacing, metadata, is_seg=False):
 def n4_bias_correction(image):
     '''
     Bias correction.
-    
-    Args:
-        image: the targeted image
-    Returns:
-        Bias corrected image.
     '''
     # Convert the image to a floating point type
     image = sitk.Cast(image, sitk.sitkFloat32)
@@ -128,8 +123,8 @@ def create_4Dimage_array(images_list):
     '''
     Stack images in the channel dimention.
 
-    Args:
-        images_list: a list that contains read images by SimpleITK.
+    images_list: a list that contains read images by SimpleITK.
+    
     Returns:
         A 4D image in itk format
     '''
@@ -150,7 +145,9 @@ def create_4Dimage_array(images_list):
     return image_itk_4D
 
 def set_image_orientation(image, image_4D):
-    """Set the 4D image orientation based on the original image."""
+    '''
+    Set the 4D image orientation based on the original image.
+    '''
     
     direction_img = image.GetDirection()
     direction_4Dimg = image_4D.GetDirection()

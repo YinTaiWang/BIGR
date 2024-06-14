@@ -1,11 +1,15 @@
 import os
+import sys
+sys.path.append(os.path.abspath('../'))
 import warnings
+from tqdm import tqdm
 import SimpleITK as sitk
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 
 from set_preprocess import *
 from utils.file_and_folder_operations import *
-from dataset_fingerprint import generate_dataset_json, generate_dataset_properties
+from dataset_fingerprint import generate_dataset_json, generate_dataset_properties, generate_plans
+from utils.tasks_by_id import set_preprocess_path_by_id
 
 ################################## MAIN ##################################
 def preprocess(args):
@@ -22,43 +26,51 @@ def preprocess(args):
     (task_name, 
      RawTask_dir, PreprocessTask_dir, 
      RawIMG_dir, RawSEG_dir, 
-     PreprocessIMG_dir, PreprocessSEG_dir) = set_paths(root_path, task_id)
+     PreprocessIMG_dir, PreprocessSEG_dir) = set_preprocess_path_by_id(root_path, task_id)
     
     print(f"\nThe processed files would be save at:"
           f"\nImages: {PreprocessIMG_dir}"
           f"\nSegmentations: {PreprocessSEG_dir}")
     
-    generate_dataset_properties(RawTask_dir)
-    generate_dataset_json(output_file = os.path.join(RawTask_dir, "dataset.json"), 
+    generate_dataset_json(output_path = os.path.join(RawTask_dir, "dataset.json"), 
                           imagesTr_dir = RawIMG_dir,
                           labelsTr_dir = RawSEG_dir, 
                           dataset_name = task_name)
+    generate_dataset_properties(output_path = os.path.join(RawTask_dir, "dataset_properties.pkl"),
+                                task_path = RawTask_dir)
+    
+    #############################  Plans  #############################
+    dataset_properties = load_pickle(os.path.join(RawTask_dir, "dataset_properties.pkl"))
+    generate_plans(output_path = os.path.join(PreprocessTask_dir, "plans.json"),
+                   data_properties=dataset_properties)
     
     ###########################  Preprocess  ###########################
     dataset_json = load_json(os.path.join(RawTask_dir, "dataset.json"))
-    dataset_properties = load_pickle(os.path.join(RawTask_dir, "dataset_properties.pkl"))
+    plans = load_json(os.path.join(RawTask_dir, "plans.json"))
     
-    for training_data in dataset_json['training']:
+    for training_data in tqdm(dataset_json['training']):
         image_list = training_data['image']
         seg_file = training_data['label'] # assume only has one
         processed_imgs_list = list()
         
-        reference_metadata = get_reference_metadata(training_data, RawIMG_dir, RawSEG_dir)
+        reference_metadata = get_reference_metadata(training_data, RawIMG_dir)
         
         for img_file in image_list:
             img_dir = os.path.join(RawIMG_dir, img_file)
             img = sitk.ReadImage(img_dir) 
-            reference_spacing = dataset_properties['median_spacing']
-            processed_img = resampling(img, reference_spacing, reference_metadata, is_seg=False)
+            target_spacing = plans['preprocess']['target_spacing']
+            processed_img = resampling(img, target_spacing, reference_metadata, is_seg=False)
             
             if BIAS_CORRECTION:
                 processed_img = n4_bias_correction(processed_img)
                 
             processed_imgs_list.append(processed_img)
-            
+        
+        # Segmentation only needs resampling
+        # We assume only has one segmentation!
         seg_dir = os.path.join(RawSEG_dir, seg_file)
         seg = sitk.ReadImage(seg_dir)
-        processed_seg = resampling(seg, reference_spacing, reference_metadata, is_seg=True)
+        processed_seg = resampling(seg, target_spacing, reference_metadata, is_seg=True)
         sitk.WriteImage(processed_seg, os.path.join(PreprocessSEG_dir, seg_file))
         
         if RIGID_TRANSFORMATION:
