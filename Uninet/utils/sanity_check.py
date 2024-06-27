@@ -7,15 +7,20 @@ from matplotlib.patches import Patch
 class Sanity_check():
     def __init__(self, outputs, data, save_dir):
         ## Check outputs
-        # reg4d, data has length 1
+        # seg3d and reg4d, post processed data has length 1
         # seg4d, post processed data has length 4
-        if len(outputs) == 1 or len(outputs) == 4:
+        if len(outputs) == 1:
+            self.outputs = outputs
+        elif len(outputs) == 4:
             self.outputs = outputs
         elif len(outputs) == 2:
             self.regoutputs = outputs[0].cpu().detach()
             self.segoutputs = outputs[1].cpu().detach()
         else:
             raise ValueError("Only takes one of the reg or seg output or both.")
+        
+        if isinstance(self.outputs, torch.Tensor):
+            self.outputs = self.outputs.cpu().detach()
         
         ## Check data
         if len(data) == 4:
@@ -81,13 +86,14 @@ class Sanity_check():
         '''
         middle_slice = self.find_middle_slice_with_label()
 
-        fig, axes = plt.subplots(1, 3, figsize=(12,5))
-        axes[0].set_title(f"Image slice {middle_slice}")
-        axes[0].imshow(self.image[0, 0, :, :, middle_slice], cmap="gray")
-        axes[1].set_title(f"Mask slice {middle_slice}")
-        axes[1].imshow(self.seg[0, 0, :, :, middle_slice])
-        axes[2].set_title(f"Output slice {middle_slice}")
-        axes[2].imshow(torch.argmax(torch.tensor(self.outputs), dim=1)[0, :, :, middle_slice])
+        fig, axes = plt.subplots(1, 4, figsize=(12,5))
+        fig.suptitle(f"{self.patient}_slice {middle_slice} (phase={self.phase})", fontsize=16, fontweight='bold')
+        
+        axes[0].imshow(self.image[0, 0, :, :, middle_slice], cmap="gray")           # only image
+        axes[1].imshow(self.seg[0, 0, :, :, middle_slice])                          # ground truth
+        axes[2].imshow(self.outputs[0].cpu().detach()[1, :, :, middle_slice])       # prediction
+        axes[3].imshow(self.image[0, 0, :, :, middle_slice], cmap="gray")           # image + prediction
+        axes[3].imshow(self.outputs[0].cpu().detach()[1, :, :, middle_slice], alpha=0.3)       
         plt.tight_layout()
         plt.savefig(self.save_dir)
         plt.close(fig)
@@ -101,17 +107,17 @@ class Sanity_check():
         fig, axes = plt.subplots(2,5, figsize=(12,5))
         fig.suptitle(f"{self.patient}_slice {middle_slice} (phase={self.phase})", fontsize=16, fontweight='bold')
         
-        # First row -- images
+        # First row -- only images
         for i in range(self.image.shape[1]):
             axes[0,i].imshow(self.image[0, i, :, :, middle_slice], cmap="gray")
         
         # Second row -- predictions
         for i in range(4):
             axes[1,i].imshow(self.outputs[i].cpu().detach()[1, :, :, middle_slice])
-            # First row, last pic -- images + seg
+            # First row, last pic -- images + prediction
             if i == self.phase:
                 axes[0,4].imshow(self.image[0, i, :, :, middle_slice], cmap="gray") # image
-                axes[0,4].imshow(self.outputs[i].cpu().detach()[1, :, :, middle_slice], alpha=0.3) # seg
+                axes[0,4].imshow(self.outputs[i].cpu().detach()[1, :, :, middle_slice], alpha=0.3) # prediction
         
         # Second row, last pic -- ground truth
         axes[1,4].imshow(self.seg[0, 0, :, :, middle_slice])
@@ -171,5 +177,5 @@ class Sanity_check():
     @classmethod
     def check_joint4d(cls, outputs, data, save_dir):
         instance = cls(outputs, data, save_dir)
-        instance.joint4d_plots()
+        instance.joint_plots()
         

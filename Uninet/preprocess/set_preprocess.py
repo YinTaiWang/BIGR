@@ -13,7 +13,7 @@ def get_reference_metadata(data_dict, RawIMG_dir):
     Obtain the metadata from the reference image.
     
     Args:
-        data_dict: A dictionary contains data id, image, and label. Could obtain it from `dataset.json`.
+        data_dict: A dictionary contains data id, image, and label. Obtain it from `dataset.json`.
         rawimg_dir: path to raw image
 
     Returns:
@@ -40,7 +40,6 @@ def get_reference_metadata(data_dict, RawIMG_dir):
         ref_metadata["spacing"] = img.GetSpacing()
         ref_metadata["direction"] = img.GetDirection()
         ref_metadata["origin"] = img.GetOrigin()
-        ref_metadata["pixelvalue"] = img.GetPixelIDValue()
     else:
         raise ValueError("The image file is not exist.")
     return ref_metadata

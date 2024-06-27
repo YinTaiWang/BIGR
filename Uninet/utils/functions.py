@@ -1,4 +1,6 @@
+import os
 import csv
+import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
@@ -27,13 +29,27 @@ def scale_to_origin(scaled_image, scaled_seg, scaled_prediction, original_shape)
     prediction = F.interpolate(scaled_prediction, size=original_shape, mode='nearest', recompute_scale_factor=False)
     return image, seg, prediction
 
-def add_padding_to_divisible(image, divisor):
+def calculate_reduction_factors(strides):
+    # Initialize reduction factors
+    depth_reduction = 1
+    height_reduction = 1
+    width_reduction = 1
+
+    # Calculate the cumulative reduction factor for each dimension
+    for stride in strides:
+        depth_reduction *= stride[0]
+        height_reduction *= stride[1]
+        width_reduction *= stride[2]
+
+    return [depth_reduction, height_reduction, width_reduction]
+
+def add_padding_to_divisible(image, divisors):
     """
     Pads the image so that its dimensions are divisible by the specified divisor.
     
     Args:
-        image (torch.Tensor): The input image tensor of shape (N, C, D, H, W)
-        divisor (int): The number to which the dimensions should be divisible.
+        image (torch.Tensor): The input image tensor of shape (B, C, D, H, W)
+        divisor (list): The number to which the dimensions should be divisible.
     
     Returns:
         torch.Tensor: The padded image tensor.
@@ -42,9 +58,9 @@ def add_padding_to_divisible(image, divisor):
     depth, height, width = image.shape[2], image.shape[3], image.shape[4]
 
     # Calculate the padding needed to make each dimension divisible by `divisor`
-    pad_depth = (divisor - depth % divisor) % divisor
-    pad_height = (divisor - height % divisor) % divisor
-    pad_width = (divisor - width % divisor) % divisor
+    pad_depth = (divisors[0] - depth % divisors[0]) % divisors[0]
+    pad_height = (divisors[1] - height % divisors[1]) % divisors[1]
+    pad_width = (divisors[2] - width % divisors[2]) % divisors[2]
 
     # Define padding for depth, height, and width
     # Padding order in F.pad for 5D tensor is (pad_left, pad_right, pad_top, pad_bottom, pad_front, pad_back)
@@ -81,114 +97,3 @@ def update_epoch_stats(stats, losses):
     for i, key in enumerate(keys): # skip metric_dice
         stats[key] += losses[i].item()
     return stats
-
-def write_csv(dictionary, save_dir):
-    '''
-    Args:
-        dictionary: a dictionary containing the loss and metric values
-        save_dir: directory to save the CSV file
-    '''
-    with open(save_dir, 'w', newline='') as file:
-        writer = csv.writer(file)
-        # Find the maximum length of the data to set the number of epochs
-        max_length = max(len(v) for v in dictionary.values())
-        # Write the header
-        writer.writerow(['Epoch'] + list(dictionary.keys()))
-
-        # Write data for each epoch
-        for i in range(max_length):
-            row = [i + 1]  # Epoch number
-            for key in dictionary.keys():
-                try:
-                    # Try to add the value for this epoch, if it exists
-                    row.append(dictionary[key][i])
-                except IndexError:
-                    # If the value doesn't exist for this metric at this epoch, add a blank
-                    row.append('')
-            writer.writerow(row)
-
-    print(f"{save_dir} created")
-
-
-def get_mean_std(list_w_dicts, metric):
-    metric_values = [fold[metric] for fold in list_w_dicts]
-    metric_values = list(zip(*metric_values))
-
-    means = [np.mean(epoch) for epoch in metric_values]
-    stds = [np.std(epoch) for epoch in metric_values]
-    return np.array(means), np.array(stds)
-
-def plot_cv(CV_train_history, CV_val_history, save_dir):
-    
-    # Create map for title names
-    map = {
-        'total_loss': 'Average Loss',
-        'loss_dice': 'Dice Loss',
-        'loss_consis': 'Consistency Loss',
-        'loss_ncc': 'Similarity Loss',
-        'loss_smo': 'Smoothness Loss',
-        'metric_dice': 'Average Dice',
-        'metric_ncc': 'Average NCC',
-        }
-    
-    # Create proper setting for plots
-    # if we have only two items in the history
-    two_plots = False
-    items = list(CV_train_history[0].keys())
-    n_subplots = len(items)
-    items_1 = items
-    
-    # if we have more than two items
-    if n_subplots > 2:
-        two_plots = True
-        n_subplots = 3
-        n_subplots_2 = len(items) - n_subplots
-        items_1 = [item for item in items if 'loss_' not in item]
-        items_2 = [item for item in items if 'loss_' in item]
-        
-        
-    fig, axes = plt.subplots(1, n_subplots, figsize=(20, 5))
-    for i, item in enumerate(items_1):
-        train_mean, train_std = get_mean_std(CV_train_history, metric=item)
-        val_mean, val_std = get_mean_std(CV_val_history, metric=item)
-        train_epochs = range(1, len(train_mean) + 1)
-        val_epochs = range(1, len(val_mean) + 1)
-        
-        axes[i].plot(train_epochs, train_mean, label=f'train')
-        axes[i].plot(val_epochs, val_mean, label=f'val')
-        axes[i].fill_between(train_epochs, train_mean - train_std, train_mean + train_std, alpha=0.3)
-        axes[i].fill_between(val_epochs, val_mean - val_std, val_mean + val_std, alpha=0.3)
-        axes[i].legend()
-        axes[i].set_title(map[item])
-        axes[i].set_xlabel("Epoch")
-    
-    plt.tight_layout()
-    file_name = "overview.png"
-    plt.savefig(os.path.join(save_dir, file_name))
-    plt.close(fig)
-
-    ##############################################################################
-    # Plot separate losses
-    if two_plots:
-        fig, axes = plt.subplots(int(n_subplots_2/2), 2, figsize=(20, 10))
-        
-        for i, item in enumerate(items_2):
-            train_mean, train_std = get_mean_std(CV_train_history, metric=item)
-            val_mean, val_std = get_mean_std(CV_val_history, metric=item)
-            train_epochs = range(1, len(train_mean) + 1)
-            val_epochs = range(1, len(val_mean) + 1)
-            
-            row = i // 2
-            col = i % 2
-            axes[row, col].plot(train_epochs, train_mean, label=f'train')
-            axes[row, col].plot(val_epochs, val_mean, label=f'val')
-            axes[row, col].fill_between(train_epochs, train_mean - train_std, train_mean + train_std, alpha=0.3)
-            axes[row, col].fill_between(val_epochs, val_mean - val_std, val_mean + val_std, alpha=0.3)
-            axes[row, col].legend()
-            axes[row, col].set_title(map[item])
-            axes[row, col].set_xlabel("Epoch")
-
-        plt.tight_layout()
-        file_name = "overview_2.png"
-        plt.savefig(os.path.join(save_dir, file_name))
-        plt.close(fig)
