@@ -49,84 +49,84 @@ def preprocess(args):
                    rigid_transformation = RIGID_TRANSFORMATION)
     
     ###########################  Preprocess  ###########################
-    # plans = load_json(os.path.join(PreprocessTask_dir, "plans.json"))
-    # target_spacing = plans['preprocess']['Target_spacing']
+    plans = load_json(os.path.join(PreprocessTask_dir, "plans.json"))
+    target_spacing = plans['preprocess']['Target_spacing']
     
-    # for training_data in tqdm(dataset_json['Training']):
-    #     processed_imgs_list = []
+    for training_data in tqdm(dataset_json['Training']):
+        processed_imgs_list = []
         
-    #     image_list = training_data['image']
-    #     seg_file = training_data['label'] # assume only has one
-    #     reference_metadata = get_reference_metadata(training_data, RawIMG_dir)
+        image_list = training_data['image']
+        seg_file = training_data['label'] # assume only has one
+        reference_metadata = get_reference_metadata(training_data, RawIMG_dir)
         
-    #     for img_file in image_list:
-    #         img_dir = os.path.join(RawIMG_dir, img_file)
-    #         img = sitk.ReadImage(img_dir)
-    #         # target_spacing = [1.5, 1.5, 2.5] # testing
-    #         processed_img = resampling(img, target_spacing, reference_metadata, is_seg=False)
+        for img_file in image_list:
+            img_dir = os.path.join(RawIMG_dir, img_file)
+            img = sitk.ReadImage(img_dir)
+            # target_spacing = [1.5, 1.5, 2.5] # testing
+            processed_img = resampling(img, target_spacing, reference_metadata, is_seg=False)
             
-    #         if BIAS_CORRECTION:
-    #             processed_img = n4_bias_correction(processed_img)
+            if BIAS_CORRECTION:
+                processed_img = n4_bias_correction(processed_img)
                 
-    #         processed_imgs_list.append(processed_img)
+            processed_imgs_list.append(processed_img)
         
-    #     # Segmentation only needs resampling
-    #     # We assume only has one segmentation!
-    #     seg_dir = os.path.join(RawSEG_dir, seg_file)
-    #     seg = sitk.ReadImage(seg_dir)
-    #     processed_seg = resampling(seg, target_spacing, reference_metadata, is_seg=True)
-    #     sitk.WriteImage(processed_seg, os.path.join(PreprocessSEG_dir, seg_file))
+        # Segmentation only needs resampling
+        # We assume only has one segmentation!
+        seg_dir = os.path.join(RawSEG_dir, seg_file)
+        seg = sitk.ReadImage(seg_dir)
+        processed_seg = resampling(seg, target_spacing, reference_metadata, is_seg=True)
+        sitk.WriteImage(processed_seg, os.path.join(PreprocessSEG_dir, seg_file))
         
-    #     if len(processed_imgs_list) < 1:
-    #         warnings.warn("Single image found, skipping 4D processing and rigid transformation.")
-    #         img3D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
-    #         sitk.WriteImage(processed_imgs_list[0], img3D_out_dir)
-    #     else:
-    #         if RIGID_TRANSFORMATION:
-    #             processed_imgs_list = rigid_transformation(processed_imgs_list, training_data['gt_phase'])
-    #         image_itk_4D = create_4Dimage_array(processed_imgs_list)
+        if len(processed_imgs_list) < 1:
+            warnings.warn("Single image found, skipping 4D processing and rigid transformation.")
+            img3D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
+            sitk.WriteImage(processed_imgs_list[0], img3D_out_dir)
+        else:
+            if RIGID_TRANSFORMATION:
+                processed_imgs_list = rigid_transformation(processed_imgs_list, training_data['gt_phase'])
+            image_itk_4D = create_4Dimage_array(processed_imgs_list)
             
-    #         ## Set output metadata
-    #         image_itk_4D.SetSpacing(processed_imgs_list[0].GetSpacing() + (1,))
-    #         image_itk_4D.SetOrigin(processed_imgs_list[0].GetOrigin() + (0,))
-    #         image_itk_4D.SetDirection(set_image_orientation(processed_imgs_list[0], image_itk_4D))
+            ## Set output metadata
+            image_itk_4D.SetSpacing(processed_imgs_list[0].GetSpacing() + (1,))
+            image_itk_4D.SetOrigin(processed_imgs_list[0].GetOrigin() + (0,))
+            image_itk_4D.SetDirection(set_image_orientation(processed_imgs_list[0], image_itk_4D))
             
-    #         img4D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
-    #         itk.imwrite(image_itk_4D, img4D_out_dir)
+            img4D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
+            itk.imwrite(image_itk_4D, img4D_out_dir)
         
         
-    #     if RIGID_TRANSFORMATION:
-    #         if len(processed_imgs_list) > 1:
-    #             processed_imgs_list = rigid_transformation(processed_imgs_list, training_data['gt_phase'])
-    #             image_itk_4D = create_4Dimage_array(processed_imgs_list)
+        if RIGID_TRANSFORMATION:
+            if len(processed_imgs_list) > 1:
+                processed_imgs_list = rigid_transformation(processed_imgs_list, training_data['gt_phase'])
+                image_itk_4D = create_4Dimage_array(processed_imgs_list)
                 
-    #             ## Set output metadata
-    #             image_itk_4D.SetSpacing(processed_imgs_list[0].GetSpacing() + (1,))
-    #             image_itk_4D.SetOrigin(processed_imgs_list[0].GetOrigin() + (0,))
-    #             image_itk_4D.SetDirection(set_image_orientation(processed_imgs_list[0], image_itk_4D))
+                ## Set output metadata
+                image_itk_4D.SetSpacing(processed_imgs_list[0].GetSpacing() + (1,))
+                image_itk_4D.SetOrigin(processed_imgs_list[0].GetOrigin() + (0,))
+                image_itk_4D.SetDirection(set_image_orientation(processed_imgs_list[0], image_itk_4D))
                 
-    #             img4D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
-    #             itk.imwrite(image_itk_4D, img4D_out_dir)
-    #         else:
-    #             warnings.warn("Single image found, skipping 4D processing and rigid transformation.")
+                img4D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
+                itk.imwrite(image_itk_4D, img4D_out_dir)
+            else:
+                warnings.warn("Single image found, skipping 4D processing and rigid transformation.")
                 
-    #             img3D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
-    #             sitk.WriteImage(processed_imgs_list[0], img3D_out_dir)
-    #     else:
-    #         if len(processed_imgs_list) > 1:
-    #             warnings.warn("Make sure you really don't want to perform rigid transformation...")
-    #             image_itk_4D = create_4Dimage_array(processed_imgs_list)
+                img3D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
+                sitk.WriteImage(processed_imgs_list[0], img3D_out_dir)
+        else:
+            if len(processed_imgs_list) > 1:
+                warnings.warn("Make sure you really don't want to perform rigid transformation...")
+                image_itk_4D = create_4Dimage_array(processed_imgs_list)
                 
-    #             ## Set output metadata
-    #             image_itk_4D.SetSpacing(processed_imgs_list[0].GetSpacing() + (1,))
-    #             image_itk_4D.SetOrigin(processed_imgs_list[0].GetOrigin() + (0,))
-    #             image_itk_4D.SetDirection(set_image_orientation(processed_imgs_list[0], image_itk_4D))
+                ## Set output metadata
+                image_itk_4D.SetSpacing(processed_imgs_list[0].GetSpacing() + (1,))
+                image_itk_4D.SetOrigin(processed_imgs_list[0].GetOrigin() + (0,))
+                image_itk_4D.SetDirection(set_image_orientation(processed_imgs_list[0], image_itk_4D))
                 
-    #             img4D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
-    #             itk.imwrite(image_itk_4D, img4D_out_dir)
-    #         else:
-    #             img3D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
-    #             sitk.WriteImage(processed_imgs_list[0], img3D_out_dir)
+                img4D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
+                itk.imwrite(image_itk_4D, img4D_out_dir)
+            else:
+                img3D_out_dir = os.path.join(PreprocessIMG_dir, f"{training_data['id']}.nii.gz")
+                sitk.WriteImage(processed_imgs_list[0], img3D_out_dir)
     
     generate_dataset_properties(output_path = os.path.join(PreprocessTask_dir, "new_dataset_properties.pkl"),
                                 task_path = PreprocessTask_dir)    
