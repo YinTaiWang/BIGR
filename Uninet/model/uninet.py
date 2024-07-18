@@ -1,11 +1,10 @@
-import warnings
 from typing import Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
 
 
-class UNet(nn.Module):
+class UniNet(nn.Module):
     '''
     UNet. 
     Adapted from: https://github.com/Douwe-Spaanderman/InteractiveNet/blob/main/interactivenet/networks/unet.py
