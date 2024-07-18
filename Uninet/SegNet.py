@@ -28,7 +28,7 @@ from utils.tasks_by_id import set_results_path_by_id
 ################
 ##  Settings  ##
 ################
-TEST_MODE = True # use only a small part of data
+TEST_MODE = False # use only a small part of data
 VALIDATE_MODEL = True # perform the validation set
 
 ################################## MAIN ##################################
@@ -425,8 +425,7 @@ def main(args):
                             f"\nbest mean dice: {best_metric:.4f} at epoch: {best_metric_epoch}")
                         print(f"-- {(time.time()-epoch_start_time):.4f} seconds --")
 
-                save_dir = os.path.join(model_dir, f"progress.png")
-                plot_one_fold_results(train_history, val_history, save_dir)
+                plot_one_fold_results(train_history, val_history, model_dir)
                 
             torch.save(model.state_dict(), os.path.join(model_dir, f"seg_fold{fold}_final.pth"))
             print("saved the final model")
