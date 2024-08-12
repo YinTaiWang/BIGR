@@ -216,14 +216,27 @@ def _compute_losses(warped_image, warped_seg, disp_t2i, outputs_seg,
 
         return total_loss
     
-    loss_dice = compute_dice_loss(outputs_seg, labels, loss_functions['dice'])
-    loss_consis = loss_functions['consis'](warped_seg)
-    loss_simi = loss_functions['ncc'](warped_image, torch.mean(warped_image, dim=1, keepdim=True))
-    loss_smooth = loss_functions['grad'](disp_t2i)
-    ncc_metric = -loss_simi
+    losses = []
+    total_loss = compute_dice_loss(outputs_seg, labels, loss_functions['dice'])
+    losses.append(total_loss.item()) # loss_dice
     
-    total_loss = loss_dice + (loss_simi + (config['weight_r'] * loss_smooth)) + loss_consis 
-    losses = [total_loss, loss_dice, loss_consis, loss_simi, loss_smooth, ncc_metric]
+    total_loss += loss_functions['consis'](warped_seg)
+    losses.append(total_loss.item()) # loss_consis
+    
+    total_loss += loss_functions['ncc'](warped_image, torch.mean(warped_image, dim=1, keepdim=True))
+    losses.append(total_loss.item())  # loss_simi
+    
+    total_loss += loss_functions['grad'](disp_t2i) * config['weight_r']
+    losses.append(total_loss.item())  # loss_smooth
+    
+    for i in range(len(losses)-1, 0, -1):
+        losses[i] = losses[i] - losses[i-1] # calculate each element's actual value
+    
+    losses.insert(0, total_loss.item()) # total_loss
+    losses.append(-losses[-2]) # ncc_metric
+    
+    torch.cuda.empty_cache()
+    
     return total_loss, losses
 
 def _update_epoch_stats(stats, losses):
@@ -232,7 +245,7 @@ def _update_epoch_stats(stats, losses):
         if key == 'metric_dice':
             continue
         else: #total_loss, loss_dice, loss_consis, loss_simi, loss_smooth, ncc_metric
-            stats[key] += losses[i].item()
+            stats[key] += losses[i]
     return stats
 
 ################################## MAIN ##################################
@@ -312,41 +325,48 @@ def main(args):
                         train_data["phase"]
                     )
                     
-                    # CHECK MEM
                     print("======NEW IMG====== ", image.shape)
+                    # huge image
+                    if image.shape[2] > 300:
+                        image = F.interpolate(image, 
+                                            scale_factor = 0.7, 
+                                            align_corners = True, 
+                                            mode = 'trilinear', 
+                                            recompute_scale_factor = False)
+                        seg = F.interpolate(seg.to(torch.float32), 
+                                        scale_factor = 0.7, 
+                                        mode ='nearest', 
+                                        recompute_scale_factor = False)
+                    # CHECK MEM
+                    
                     mem = torch.cuda.memory_allocated(device)
-                    print(f'After load data {x+1}: {(mem/2**30):.2f} GB')
-                    # old_img_shape = np.array(image.shape[2:])
+                    print(f'After load data {patient}: {(mem/2**30):.2f} GB')
+                    cache = torch.cuda.memory_reserved(device)
+                    print(f'cache {patient}: {(cache/2**30):.2f} GB')
                     
                     # Preprocess
                     image = add_padding_to_divisible(image, divisors)
                     seg = add_padding_to_divisible(seg, divisors)
                     patient = patient[0]
                     phase = int(phase[0])
-                    # print("Difference: ", np.array(image.shape[2:]) - old_img_shape)
-                    
-                    # CHECK MEM
-                    mem = torch.cuda.memory_allocated(device)
-                    print(f'After padding {x+1}: {(mem/2**30):.2f} GB')
                         
                     # Model prediction
                     outputs_seg, outputs_reg = model(image)
                     
-                    
                     # CHECK MEM
                     mem = torch.cuda.memory_allocated(device)
-                    print(f'After prediction {x+1}: {(mem/2**30):.2f} GB')
+                    print(f'After prediction {patient}: {(mem/2**30):.2f} GB')
+                    cache = torch.cuda.memory_reserved(device)
+                    print(f'cache {patient}: {(cache/2**30):.2f} GB')
                     
                     warped_image, warped_post_seg, disp_t2i, metric_dice = outputs_handler(
                         outputs_seg, outputs_reg, image, seg, spatial_transformer, dice_metric, CONFIG)
                     
-                    # CLEAN
-                    del outputs_reg
-                    torch.cuda.empty_cache()
-                    
                     # CHECK MEM
                     mem = torch.cuda.memory_allocated(device)
-                    print(f'After post output {x+1}: {(mem/2**30):.2f} GB')
+                    print(f'After post output {patient}: {(mem/2**30):.2f} GB')
+                    cache = torch.cuda.memory_reserved(device)
+                    print(f'cache {patient}: {(cache/2**30):.2f} GB')
                     
                     # Sanity check
                     if (epoch+1 == 1) or ((epoch + 1) % CONFIG['check_tr_interval']) == 0:
@@ -355,10 +375,13 @@ def main(args):
                         if not os.path.exists(check_dir):
                             print(f"Create 'train_check_fold{fold}' folder for training output.")
                             os.makedirs(check_dir, exist_ok=True)
-                        save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{x+1}.png")
+                        save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{patient}.png")
                         Sanity_check.check_joint4d(outputs = (warped_image, warped_post_seg), 
                                                 data = (image, seg, patient, phase), 
                                                 save_dir = save_dir)
+                    
+                    del image
+                    torch.cuda.empty_cache()
                     
                     # Losses
                     if CONFIG['deep_supervision']:
@@ -373,14 +396,26 @@ def main(args):
                     stats['metric_dice'] += metric_dice
                     stats = _update_epoch_stats(stats, losses)
                     
+                    # Print info every n batch 
+                    if step % 20 == 0:  
+                        print(f"{step}/{len(train_ds) // train_loader.batch_size}")
+                        losses_var = ['total_loss', 'loss_dice', 'loss_consis', 'loss_simi', 'loss_smooth']
+                        max_key_length = max(len(var) for var in losses_var)
+                        for i, var in enumerate(losses_var):
+                            print(f'{var.upper():<{max_key_length + 3}}{losses[i]:.4f}')
+                        print("---")
+                    
                     # CLEAN
-                    del image, seg, patient, phase
-                    del warped_image, warped_post_seg, disp_t2i, outputs_seg
+                    del seg, phase, losses
+                    del warped_image, warped_post_seg, disp_t2i
                     torch.cuda.empty_cache()
+                    gc.collect()
                     
                     # CHECK MEM
                     mem = torch.cuda.memory_allocated(device)
-                    print(f'CLEAN {x+1}: {(mem/2**30):.2f} GB')
+                    print(f'CLEAN {patient}: {(mem/2**30):.2f} GB')
+                    cache = torch.cuda.memory_reserved(device)
+                    print(f'cache {patient}: {(cache/2**30):.2f} GB')
                     
                     ################### TRAIN ONLY ###################
                     # Backpropagation
@@ -395,16 +430,10 @@ def main(args):
                     # CHECK MEM
                     mem = torch.cuda.memory_allocated(device)
                     print(f'After backpropagation {x}: {(mem/2**30):.2f} GB')
-                    
-                    # Print info every n batch 
-                    if step % 20 == 0:  
-                        print(f"{step}/{len(train_ds) // train_loader.batch_size}")
-                        losses_var = ['total_loss', 'loss_dice', 'loss_consis', 'loss_simi', 'loss_smooth']
-                        max_key_length = max(len(var) for var in losses_var)
-                        for i, var in enumerate(losses_var):
-                            print(f'{var.upper():<{max_key_length + 3}}{losses[i]:.4f}')
-                        print("---")
-                    
+                    cache = torch.cuda.memory_reserved(device)
+                    print(f'cache {patient}: {(cache/2**30):.2f} GB')
+                
+                # LR scheduler
                 scheduler.step()
                 for param_group in optimizer.param_groups:
                     current_lr = param_group['lr']
@@ -448,9 +477,13 @@ def main(args):
                                 val_data["phase"]
                             )
                             
+                            # image = image.to(dtype=torch.float16)
+                            # seg = seg.to(dtype=torch.float16)
                             print("======NEW VAL IMG====== ", image.shape)
                             mem = torch.cuda.memory_allocated(device)
-                            print(f'After load data {x+1}: {(mem/2**30):.2f} GB')
+                            print(f'After load data {patient}: {(mem/2**30):.2f} GB')
+                            cache = torch.cuda.memory_reserved(device)
+                            print(f'cache {patient}: {(cache/2**30):.2f} GB')
                             
                             # Preprocess
                             image = add_padding_to_divisible(image, divisors)
@@ -463,14 +496,18 @@ def main(args):
                             
                             # CHECK MEM
                             mem = torch.cuda.memory_allocated(device)
-                            print(f'After prediction {x+1}: {(mem/2**30):.2f} GB')
+                            print(f'After prediction {patient}: {(mem/2**30):.2f} GB')
+                            cache = torch.cuda.memory_reserved(device)
+                            print(f'cache {patient}: {(cache/2**30):.2f} GB')
                             
                             warped_image, warped_post_seg, disp_t2i, metric_dice = outputs_handler(
                                 outputs_seg, outputs_reg, image, seg, spatial_transformer, dice_metric, CONFIG)
 
-                            del outputs_reg
-                            torch.cuda.empty_cache()
-                            
+                            # CHECK MEM
+                            mem = torch.cuda.memory_allocated(device)
+                            print(f'After post output {patient}: {(mem/2**30):.2f} GB')
+                            cache = torch.cuda.memory_reserved(device)
+                            print(f'cache {patient}: {(cache/2**30):.2f} GB')
                         
                             # Sanity check
                             if (epoch+1 == 1) or ((epoch + 1) % CONFIG['check_val_interval']) == 0:
@@ -479,10 +516,13 @@ def main(args):
                                 if not os.path.exists(check_dir):
                                     print(f"Create 'val_check_fold{fold}' folder for validation output.")
                                     os.makedirs(check_dir, exist_ok=True)
-                                save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{y+1}.png")
+                                save_dir = os.path.join(check_dir, f"epoch{epoch+1}_{patient}.png")
                                 Sanity_check.check_joint4d(outputs = (warped_image, warped_post_seg), 
                                                 data = (image, seg, patient, phase), 
                                                 save_dir = save_dir)
+                            
+                            del image
+                            torch.cuda.empty_cache()
                             
                             # Losses
                             if CONFIG['deep_supervision']:
@@ -504,7 +544,19 @@ def main(args):
                                 for i, var in enumerate(losses_var):
                                     print(f'{var.upper():<{max_key_length + 3}}{losses[i]:.4f}')
                                 print("---")
-                        
+                            
+                            # CLEAN
+                            del seg, phase, losses
+                            del warped_image, warped_post_seg, disp_t2i
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                            
+                            # CHECK MEM
+                            mem = torch.cuda.memory_allocated(device)
+                            print(f'CLEAN {patient}: {(mem/2**30):.2f} GB')
+                            cache = torch.cuda.memory_reserved(device)
+                            print(f'cache {patient}: {(cache/2**30):.2f} GB')
+                            
                         # calculate mean losses for this epoch
                         print(val_stats)
                         print("step: ", val_step)
@@ -522,11 +574,6 @@ def main(args):
                             best_loss_epoch = epoch + 1
                             torch.save(model.state_dict(), os.path.join(model_dir, f"joint_fold{fold}.pth"))
                             print("Save the new best loss model!")
-                        # if metric > best_metric:
-                        #     best_metric = metric
-                        #     best_metric_epoch = epoch + 1
-                        #     torch.save(model.state_dict(), os.path.join(model_dir, f"model_fold{fold+1}.pth"))
-                        #     print("saved new best metric model")
                             
                         print(
                             f"\nValidation -- epoch: {epoch + 1}, average total loss: {val_stats['total_loss']:.4f}"
