@@ -7,20 +7,16 @@ from matplotlib.patches import Patch
 class Sanity_check():
     def __init__(self, outputs, data, save_dir):
         ## Check outputs
-        # seg3d and reg4d, post processed data has length 1
+        # seg3d, post processed data has length 1
         # seg4d, post processed data has length 4
-        if len(outputs) == 1:
-            self.outputs = outputs
-        elif len(outputs) == 4:
-            self.outputs = outputs
-        elif len(outputs) == 2:
-            self.regoutputs = outputs[0].cpu().detach()
-            self.segoutputs = outputs[1].cpu().detach()
-        else:
-            raise ValueError("Only takes one of the reg or seg output or both.")
+        self.outputs = outputs
         
+        # print("aaaaa", type(self.outputs))
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = self.outputs.cpu().detach()
+        elif isinstance(self.outputs, tuple):
+            self.warpedimage = self.outputs[0].cpu().detach()
+            self.warpedseg = self.outputs[1].cpu().detach()
         
         ## Check data
         if len(data) == 4:
@@ -91,6 +87,7 @@ class Sanity_check():
         
         axes[0].imshow(self.image[0, 0, :, :, middle_slice], cmap="gray")           # only image
         axes[1].imshow(self.seg[0, 0, :, :, middle_slice])                          # ground truth
+        
         axes[2].imshow(self.outputs[0].cpu().detach()[1, :, :, middle_slice])       # prediction
         axes[3].imshow(self.image[0, 0, :, :, middle_slice], cmap="gray")           # image + prediction
         axes[3].imshow(self.outputs[0].cpu().detach()[1, :, :, middle_slice], alpha=0.3)       
@@ -134,7 +131,7 @@ class Sanity_check():
         middle_slice = self.find_middle_slice_with_label()
         n_images = self.image.shape[1]
         
-        fig, axes = plt.subplots(3, n_images+1, figsize=(10,5))
+        fig, axes = plt.subplots(4, n_images+1, figsize=(12,8))
         # plt.subplots_adjust(left=0.03, top=0.9, bottom=0.1, wspace=0.05, hspace=0.3)
         
         cmaps = ['Blues', 'Reds', 'Greens', 'Oranges']
@@ -143,21 +140,27 @@ class Sanity_check():
         for i in range(n_images):
             # original images
             axes[0, i].imshow(self.image[0, i, :, :, middle_slice], cmap="gray")
-            axes[0, 4].imshow(self.image[0, i, :, :, middle_slice], cmap=cmaps[i], alpha=0.8 - 0.2 * i)
+            axes[0, 4].imshow(self.image[0, i, :, :, middle_slice], cmap=cmaps[i], alpha=0.8 - 0.2 * i) # overlap
             # registration
-            axes[1, i].imshow(self.regoutputs[0, i, :, :, middle_slice], cmap='gray')
-            axes[1, 4].imshow(self.regoutputs[0, i, :, :, middle_slice], cmap=cmaps[i], alpha=0.8 - 0.2 * i)
+            axes[1, i].imshow(self.warpedimage[0, i, :, :, middle_slice], cmap='gray')
+            axes[1, 4].imshow(self.warpedimage[0, i, :, :, middle_slice], cmap=cmaps[i], alpha=0.8 - 0.2 * i) # overlap
             # segmentation
-            j = 2 * i
-            axes[2,i].imshow(torch.argmax(torch.tensor(self.segoutputs[:, j:j+2, ...]), dim=1)[0, :, :, middle_slice])
-            axes[2,4].imshow(self.seg[0, 0, :, :, middle_slice])
+            axes[2, i].imshow(self.warpedseg[0, i, :, :, middle_slice])
+            axes[2, 4].imshow(self.seg[0, 0, :, :, middle_slice]) # ground truth
+            # overlap
+            axes[3, i].imshow(self.warpedimage[0, i, :, :, middle_slice], cmap='gray')
+            axes[3, i].imshow(self.warpedseg[0, i, :, :, middle_slice], alpha=0.3)
+            
+            axes[3, 4].imshow(self.warpedseg[0, i, :, :, middle_slice], alpha=0.3)
             
         proxies = [Patch(color=plt.get_cmap(cmap)(0.8 - 0.2 * i), label=phase) for i, (cmap, phase) in enumerate(zip(cmaps, phases))]
         axes[0, 4].legend(handles=proxies, loc='upper left', bbox_to_anchor=(1.05, 1))
         axes[1, 4].legend(handles=proxies, loc='upper left', bbox_to_anchor=(1.05, 1))
-        
+        for ax in axes.flat:
+            ax.set_xticks([])
+            ax.set_yticks([])
         plt.tight_layout()
-        plt.savefig(self.save_dir)
+        plt.savefig(self.save_dir, bbox_inches='tight')
         plt.close(fig)
     
     @classmethod

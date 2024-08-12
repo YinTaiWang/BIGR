@@ -59,10 +59,9 @@ def training_transforms(seed: Optional[int] = None, validation: bool = False):
 
     return Compose(transforms)
 
-def post_transforms(ground_truth: bool = False, method: str = None):
-    if ground_truth:
+def post_transforms(label: bool = False, method: str = None):
+    if label:
         transforms = [AsDiscrete(to_onehot=2)]
-    
     else:
         transforms = [AsDiscrete(argmax=True, to_onehot=2)]
         if method == 'fillholes':
@@ -98,17 +97,16 @@ def apply_transforms(output, method=None):
         transformed_outputs = [transform(image) for image in decollate_batch(output)]
     return transformed_outputs
 
-def best_post_processing_finder(output, seg):
-    dice_metric = DiceMetric(include_background=False, reduction="mean")
+def best_post_processing_finder(output, seg, dice_metric):
     methods = [None, 'fillholes', 'largestcomponent', 'fillholes_and_largestcomponent']
     metrics = []
     transformed_outputs = []
 
     # Prepare segmentation labels for comparison
-    post_label = post_transforms(ground_truth=True)
+    post_label = post_transforms(label=True)
     post_seg = [post_label(image) for image in decollate_batch(seg)]
     if output.shape[1] > 2:
-        post_seg = post_seg * (output.shape[1]/2)
+        post_seg = post_seg * (output.shape[1]//2)
         
     for method in methods:
         transformed_output = apply_transforms(output, method=method)
@@ -120,6 +118,7 @@ def best_post_processing_finder(output, seg):
     
     max_metric = max(metrics)
     max_index = metrics.index(max_metric)
-
+    del metrics
+    
     return max_metric, methods[max_index], transformed_outputs[max_index]
     

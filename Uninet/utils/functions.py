@@ -5,15 +5,15 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
-def create_history_dict():
-    history = {'total_loss': [],
-                'loss_dice': [],
-                'loss_consis': [],
-                'loss_simi': [],
-                'loss_smooth': [],
-                'metric_dice': [],
-                'metric_ncc': []}
-    return history
+# def create_history_dict():
+#     history = {'total_loss': [],
+#                 'loss_dice': [],
+#                 'loss_consis': [],
+#                 'loss_simi': [],
+#                 'loss_smooth': [],
+#                 'metric_dice': [],
+#                 'metric_ncc': []}
+#     return history
 
 def scale(image, seg, scale):
     if scale < 1:
@@ -48,8 +48,8 @@ def add_padding_to_divisible(image, divisors):
     Pads the image so that its dimensions are divisible by the specified divisor.
     
     Args:
-        image (torch.Tensor): The input image tensor of shape (B, C, D, H, W)
-        divisor (list): The number to which the dimensions should be divisible.
+        image (torch.Tensor): The input image tensor of shape (N, C, D, H, W)
+        divisor (int): The number to which the dimensions should be divisible.
     
     Returns:
         torch.Tensor: The padded image tensor.
@@ -72,25 +72,24 @@ def add_padding_to_divisible(image, divisors):
 
     return padded_image
 
-
-def compute_losses(loss_functions, outputs_seg, ori_seg, phase, warped_input_image, template, disp_t2i):
-    loss_dice = 0
-    for c_phase, c in enumerate(range(0, outputs_seg.shape[1], 2)):
-        phase_loss = loss_functions['dice'](outputs_seg[:,c:c+2,...], ori_seg)
-        if c_phase != phase:
-            phase_loss = phase_loss * 0.8 # give less weight on the phases without ground truth
-        loss_dice += phase_loss
-    pair = int(outputs_seg.shape[1]/2)
-    loss_dice /= pair
+# def compute_losses(loss_functions, outputs_seg, ori_seg, phase, warped_input_image, template, disp_t2i):
+#     loss_dice = 0
+#     for c_phase, c in enumerate(range(0, outputs_seg.shape[1], 2)):
+#         phase_loss = loss_functions['dice'](outputs_seg[:,c:c+2,...], ori_seg)
+#         if c_phase != phase:
+#             phase_loss = phase_loss * 0.8 # give less weight on the phases without ground truth
+#         loss_dice += phase_loss
+#     pair = int(outputs_seg.shape[1]/2)
+#     loss_dice /= pair
             
-    loss_consis = loss_functions['consis'](outputs_seg)
-    loss_simi = loss_functions['ncc'](warped_input_image, template)
-    loss_smooth = loss_functions['grad'](disp_t2i)
-    ncc_metric = -loss_simi
+#     loss_consis = loss_functions['consis'](outputs_seg)
+#     loss_simi = loss_functions['ncc'](warped_input_image, template)
+#     loss_smooth = loss_functions['grad'](disp_t2i)
+#     ncc_metric = -loss_simi
     
-    total_loss = (loss_dice + loss_simi) * 0.8 + (loss_consis + loss_smooth) * 0.2
-    losses = [total_loss, loss_dice, loss_consis, loss_simi, loss_smooth, ncc_metric]
-    return total_loss, losses
+#     total_loss = (loss_dice + loss_simi) * 0.8 + (loss_consis + loss_smooth) * 0.2
+#     losses = [total_loss, loss_dice, loss_consis, loss_simi, loss_smooth, ncc_metric]
+#     return total_loss, losses
 
 def update_epoch_stats(stats, losses):
     keys = list(stats.keys())

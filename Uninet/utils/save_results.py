@@ -30,36 +30,83 @@ def write_csv(dictionary, save_dir):
 
     print(f"{save_dir} created")
 
-def plot_one_fold_results(train_history, val_history, save_dir):
+def plot_one_fold_results(train_history, val_history, model_dir):
     
-    if isinstance(train_history, dict):
-        keys = list(train_history.keys())
-    elif hasattr(train_history, 'keys'):  # In case it is a DataFrame
-        keys = list(train_history.keys())
-    elif isinstance(train_history, tuple) and hasattr(train_history[0], 'keys'):
-        train_history = train_history[0]  # Assuming the DataFrame is the first element
-        val_history = val_history[0]  # Same assumption for val_history
-        keys = list(train_history.keys())
-    else:
-        raise ValueError("Unsupported type for history")
-    
-    if 'Epoch' in keys:
-        keys.remove('Epoch')
-    
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-    for i, key in enumerate(keys):
-        axes[i].plot(train_history[key], label='train')
-        axes[i].plot(val_history[key], label='val')
-        axes[i].legend()
-        axes[i].set_xlabel("Epoch")
-    axes[0].set_title("Epoch Average Loss")
-    axes[0].set_ylabel("Loss")
-    axes[1].set_title("Epoch Average Dice")
-    axes[1].set_ylabel("Dice")
+    keys = list(train_history.keys())
+    if len(keys) == 2:
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+        for i, key in enumerate(keys):
+            axes[i].plot(train_history[key], label='train')
+            axes[i].plot(val_history[key], label='val')
+            axes[i].legend()
+            axes[i].set_xlabel("Epoch")
+        axes[0].set_title("Epoch Average Loss")
+        axes[0].set_ylabel("Loss")
+        axes[1].set_title("Epoch Average Dice")
+        axes[1].set_ylabel("Dice")
         
-    plt.tight_layout()
-    plt.savefig(save_dir)
-    plt.close(fig)
+        save_dir = os.path.join(model_dir, f"progress.png")
+        plt.tight_layout()
+        plt.savefig(save_dir, bbox_inches='tight', dpi=300)
+        plt.close(fig)
+    else:
+        # Total loss
+        plt.plot(train_history['total_loss'], label='train')
+        plt.plot(val_history['total_loss'], label='val')
+        plt.legend()
+        plt.title('Epoch Average Loss')
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        
+        save_dir = os.path.join(model_dir, f"progress.png")
+        plt.tight_layout()
+        plt.savefig(save_dir, bbox_inches='tight', dpi=300)
+        plt.clf()
+        plt.close()
+        
+        mapping = {
+            'loss_dice': 'Epoch Average Dice Loss',
+            'loss_consis': 'Epoch Average Consistency Loss',
+            'loss_simi': 'Epoch Average Similarity Loss',
+            'loss_smooth': 'Epoch Average Smoothness Loss',
+            'metric_dice': 'Epoch Average Dice',
+            'metric_ncc': 'Epoch Average NCC'}
+        
+        # Each loss
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        for i, key in enumerate(keys):
+            if 'loss_' in key:
+                x, y = (i-1)//2, (i-1)%2
+                axes[x, y].plot(train_history[key], label='train')
+                axes[x, y].plot(val_history[key], label='val')
+                axes[x, y].legend()
+                axes[x, y].set_title(mapping[key])
+                axes[x, y].set_xlabel("Epoch")
+                axes[x, y].set_ylabel("Loss")
+                
+                save_dir = os.path.join(model_dir, f"individual_losses.png")
+                fig.tight_layout()
+                fig.savefig(save_dir, bbox_inches='tight', dpi=300)
+                plt.close(fig)
+        
+        # Each metric
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+        for i, key in enumerate(keys):
+            if 'metric_' in key:
+                y = (i-5)%2
+                axes[y].plot(train_history[key], label='train')
+                axes[y].plot(val_history[key], label='val')
+                axes[y].legend()
+                axes[y].set_title(mapping[key])
+                axes[y].set_xlabel("Epoch")
+                axes[y].set_ylabel("Metric")
+                
+                save_dir = os.path.join(model_dir, f"individual_metric.png")
+                fig.tight_layout()
+                fig.savefig(save_dir, bbox_inches='tight', dpi=300)
+                plt.close(fig)
+        
+    
 
 def get_mean_std(list_w_dicts, metric):
     metric_values = [fold[metric] for fold in list_w_dicts]
@@ -73,34 +120,19 @@ def plot_cross_validation_results(CV_train_history, CV_val_history, save_dir):
     
     # Create map for title names
     map = {
-        'total_loss': 'Overall Average Loss',
-        'loss_dice': 'Overall Dice Loss',
-        'loss_consis': 'Overall Consistency Loss',
-        'loss_ncc': 'Overall Similarity Loss',
-        'loss_smo': 'Overall Smoothness Loss',
-        'metric_dice': 'Overall Average Dice',
-        'metric_ncc': 'Overall Average NCC',
+        'total_loss': 'Average Loss',
+        'loss_dice': 'Dice Loss',
+        'loss_consis': 'Consistency Loss',
+        'loss_simi': 'Similarity Loss',
+        'loss_smooth': 'Smoothness Loss',
+        'metric_dice': 'Average Dice',
+        'metric_ncc': 'Average NCC',
         }
     
     # Create proper setting for plots
     # if we have only two items in the history
     two_plots = False
-    
-    train_history = CV_train_history[0] # just take one
-    if isinstance(train_history, dict):
-        items = list(train_history.keys())
-    elif hasattr(train_history, 'keys'):  # In case it is a DataFrame
-        items = list(train_history.keys())
-    elif isinstance(train_history, tuple) and hasattr(train_history[0], 'keys'):
-        train_history = train_history[0]  # Assuming the DataFrame is the first element
-        val_history = val_history[0]  # Same assumption for val_history
-        items = list(train_history.keys())
-    else:
-        raise ValueError("Unsupported type for train_history")
-    
-    if 'Epoch' in items:
-        items.remove('Epoch')
-    
+    items = list(CV_train_history[0].keys())
     n_subplots = len(items)
     items_1 = items
     

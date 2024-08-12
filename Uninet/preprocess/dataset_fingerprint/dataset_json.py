@@ -41,19 +41,19 @@ def create_image_label_list(images_dir, labels_dir=None):
 
     return image_label_list
 
-def generate_dataset_json(output_file: str, imagesTr_dir: str, labelsTr_dir: str, dataset_name: str, imagesTs_dir: str = None):
+def generate_dataset_json(output_path: str, imagesTr_dir: str, labelsTr_dir: str, dataset_name: str, imagesTs_dir: str = None):
     
     json_dict = {}
-    json_dict['name'] = dataset_name
+    json_dict['Name'] = dataset_name
     if imagesTs_dir:
         ts_image_label_list = create_image_label_list(imagesTs_dir, None)
-        json_dict['num_of_test'] = len(ts_image_label_list)
-        json_dict['test'] = ts_image_label_list
+        json_dict['Num_of_test'] = len(ts_image_label_list)
+        json_dict['Test'] = ts_image_label_list
     tr_image_label_list = create_image_label_list(imagesTr_dir, labelsTr_dir)
-    json_dict['num_of_training'] = len(tr_image_label_list)
-    json_dict['training'] = tr_image_label_list
+    json_dict['Num_of_training'] = len(tr_image_label_list)
+    json_dict['Training'] = tr_image_label_list
 
-    if not output_file.endswith("dataset.json"):
+    if not output_path.endswith("dataset.json"):
         print("WARNING: output file name is not dataset.json! This may be intentional or not. You decide. "
               "Proceeding anyways...")
-    save_json(json_dict, output_file)
+    save_json(json_dict, output_path)
