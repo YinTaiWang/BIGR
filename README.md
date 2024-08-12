@@ -1,6 +1,4 @@
-# Project Name
-
-Joint segmentation and registration network.
+# Joint segmentation and groupwise registration network.
 
 ## Usage
 
@@ -78,3 +76,14 @@ python ./preprocess/RUN.py -root ROOT_DIRECTORY -t TASK_ID --bias_correction --r
 - `--rigid_transformation`: (Optional) Apply rigid transformation.
 
 The script will generate `dataset.json` and `dataset_properties.pkl` in the `raw_data` folder. The preprocessed images and segmentations will be in the `preprocessed` folder.
+
+### Training
+
+To run the training, run the following Python script:
+
+```
+python ./SegNet.py -root ROOT_DIRECTORY -t TASK_ID -f FOLD # 3D model
+python ./UniNet.py -root ROOT_DIRECTORY -t TASK_ID -f FOLD # 4D model
+```
+
+The results would be in the 'results' folder.
