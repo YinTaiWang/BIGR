@@ -1,110 +1,164 @@
+# U-Net copied from InteractiveNet
+# https://github.com/Douwe-Spaanderman/InteractiveNet/blob/main/interactivenet/networks/unet.py
+
 import warnings
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class UNet(nn.Module):
-    '''
-    UNet.
-    Adapted from: https://github.com/Douwe-Spaanderman/InteractiveNet/blob/main/interactivenet/networks/unet.py
+    """UNet.
 
-    Parameters:
+    Parameters
+    ----------
+    spatial_dims: int
+        number of dims in the input tensor. Currently only 3 possible (not yet 2D, 2.5D network inplemented)
     in_channels: int
-        Number of channels in the input tensor.
+        number of channels in the input tensor.
     out_channels: int
-        Number of output channels.
-    channels: list, optional
-        Specifies the number of channels for each layer.
-    act: str
-        Type of activation to use.
-    norm: str
-        Type of normalization (instance or batch).
-    '''
+        the number of features in the output segmentation or
+        size of feature space for barlow twins.
+    kernel_size: list of tuples or int
+        kernel_sizes for each layer. Also determines number oflayer
+    strides: list of tuples or int
+        strides for each layer.
+    upsample_kernel_size: list of tuples or int
+        upsample_kernel_size for each layer stride[1:].
+    activation: 'str', default 'LRELU'
+        can also provide PRELU and RELU instead.
+    normalisation: 'str', default 'instance'
+        can also provide batch normalisation instead.
+    deep_supervision: bool, default False
+        if you wish to apply deep supervision. At this time will happen at all feature spaces.
+    """
+
     def __init__(
         self,
         spatial_dims: int,
         in_channels: int,
         out_channels: int,
-        channels: Optional[Sequence[int]] = (32, 64, 128, 256),
-        act: str = "LRELU",
-        norm: str = "instance",
+        kernel_size: Sequence[Union[Sequence[int], int]],
+        strides: Sequence[Union[Sequence[int], int]],
+        upsample_kernel_size: Sequence[Union[Sequence[int], int]],
+        filters: Optional[Sequence[int]] = None,
+        activation: str = "LRELU",
+        normalisation: str = "instance",
+        deep_supervision: bool = False,
     ):
         super(UNet, self).__init__()
-        
-        assert spatial_dims == 3, 'Currently only 3D is possible.'
-        if len(channels) < 2:
-            raise ValueError("the length of 'channels' should be no less than 2.")
-        
-        self.name = "UNet"
-        self.in_channels = in_channels
+
+        if normalisation == "batch":
+            Norm = nn.BatchNorm3d
+        elif normalisation == "instance":
+            Norm = nn.InstanceNorm3d
+        else:
+            raise KeyError(
+                f"please provide batch or instance for normalisation, not {normalisation}"
+            )
+
+        if activation == "PRELU":
+            Act = nn.PReLU
+        elif activation == "LRELU":
+            Act = nn.LeakyReLU
+        elif activation == "RELU":
+            Act = nn.ReLU
+        else:
+            raise KeyError(
+                f"please provide batch or instance for normalisation, not {normalisation}"
+            )
+
         self.out_channels = out_channels
-        self.channels = channels
-        self.act = nn.LeakyReLU if act == "LRELU" else (nn.ReLU if act == "RELU" else nn.PReLU)
-        self.norm = nn.InstanceNorm3d if norm == "instance" else nn.BatchNorm3d
-        
-        # Encoder
-        self.input_block = DoubleConv(
-            in_channels=in_channels,
-            out_channels=channels[0],
-            stride=1,
-            Norm=self.norm,
-            Activation=self.act,
-        )
-        self.encoders = nn.ModuleList()
-        for i in range(1, len(self.channels) - 1):
-            self.encoders.append(
-                DoubleConv(
-                    in_channels=channels[i-1],
-                    out_channels=channels[i],
-                    stride=2,
-                    Norm=self.norm,
-                    Activation=self.act,
+        self.kernel_size = kernel_size
+        self.strides = strides
+        if filters == None:
+            self.filters = (32, 64, 128, 256, 320, 320, 320, 320)[
+                : len(self.kernel_size)
+            ]
+        else:
+            self.filters = filters
+        self.upsample_kernel_size = upsample_kernel_size[::-1]
+        self.in_channels = in_channels
+        self.deep_supervision = deep_supervision
+        self.down = []
+        self.up = []
+        self.deepsupervision = []
+        self.name = "UNet"
+
+        for i, kernel in enumerate(self.kernel_size):
+            in_channels = self.in_channels if i == 0 else out_channels
+            out_channels = self.filters[i]
+            # This is just for clarity in printing the network
+            if i == 0:
+                self.input_block = DoubleConv(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel,
+                    stride=self.strides[i],
+                    Norm=Norm,
+                    Activation=Act,
                 )
-            )
-        self.bottleneck = DoubleConv(
-            in_channels=channels[-2],
-            out_channels=channels[-1],
-            stride=2,
-            Norm=self.norm,
-            Activation=self.act,
-        )
-        
-        # Decoders
-        self.decoders = nn.ModuleList()
-        for i in range(len(self.channels)-1, 0, -1):
-            self.decoders.append(
+            elif i < len(self.kernel_size) - 1:
+                self.down.append(
+                    DoubleConv(
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        kernel_size=kernel,
+                        stride=self.strides[i],
+                        Norm=Norm,
+                        Activation=Act,
+                    )
+                )
+            else:
+                self.down = nn.ModuleList(self.down)
+                self.bottleneck = DoubleConv(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel,
+                    stride=self.strides[i],
+                    Norm=Norm,
+                    Activation=Act,
+                )
+
+        for i, kernel in enumerate(self.kernel_size[::-1][1:]):
+            in_channels = out_channels
+            out_channels = self.filters[::-1][1:][i]
+            self.up.append(
                 Up(
-                    in_channels=self.channels[i], 
-                    out_channels=self.channels[i-1],
-                    stride=2,
-                    Norm=self.norm
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel,
+                    # stride=self.strides[::-1][i],
+                    upsample_kernel_size=self.upsample_kernel_size[i],
+                    Norm=Norm,
                 )
             )
 
-        self.final_conv = nn.Conv3d(self.channels[0], self.out_channels, 1)
-        
+        self.up = nn.ModuleList(self.up)
+        self.finalconv = nn.Conv3d(
+            out_channels, self.out_channels, kernel_size=1, stride=1
+        )
+
+        if self.deep_supervision == True:
+            # Deep supervision for all but final and two lowest resolutions
+            for i, kernel in enumerate(self.kernel_size[::-1][2:-1]):
+                out_channels = self.filters[::-1][i + 2]
+                self.deepsupervision.append(
+                    nn.Conv3d(
+                        in_channels=out_channels,
+                        out_channels=2,
+                        kernel_size=1,
+                        stride=1,
+                        bias=False,
+                    )
+                )
+
+            self.deepsupervision = nn.ModuleList(self.deepsupervision)
+
+        # Weight initialization
         self.weight_initializer()
-    
-    def forward(self, x):
-        x = self.input_block(x)
-        skips = [x]
 
-        for enc in self.encoders:
-            x = enc(x)
-            skips.append(x)
-        
-        x = self.bottleneck(x)
-
-        for (dec, skip) in zip(self.decoders, reversed(skips)):
-            x = dec(x, skip)
-            
-        x = self.final_conv(x)
-        
-        return x
-    
     def weight_initializer(self):
         for module in self.modules():
             if isinstance(module, nn.ConvTranspose3d) or isinstance(module, nn.Conv3d):
@@ -117,44 +171,104 @@ class UNet(nn.Module):
                 nn.init.constant_(module.weight, 1)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
-    
-    
-##########################################################################
+
+    def forward(self, x):
+        x = self.input_block(x)
+        skips = [x]
+
+        for module in self.down:
+            x = module(x)
+            skips.append(x)
+
+        x = self.bottleneck(x)
+
+        skips = skips[::-1]
+        supervision = []
+        for i, module in enumerate(self.up):
+            x_skip = skips[i]
+            x = module(x, x_skip)
+            if self.deepsupervision and 0 < i < len(self.up) - 1:
+                x_deep = self.deepsupervision[i - 1](x)
+                supervision.append(x_deep)
+
+        x = self.finalconv(x)
+
+        if supervision:
+            supervision.append(x)
+            return supervision
+
+        return x
+
+
 class DoubleConv(nn.Module):
     def __init__(
         self,
         in_channels,
         out_channels,
-        stride,
+        kernel_size=3,
+        stride=1,
         bias=True,
         Norm=nn.InstanceNorm3d,
         Activation=nn.LeakyReLU,
     ):
         super(DoubleConv, self).__init__()
-        
-        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=bias)
+        # Checking kernel for padding
+        if kernel_size == 3 or kernel_size == [3, 3, 3]:
+            padding = 1
+        elif kernel_size == [3, 3, 1]:
+            padding = (1, 1, 0)
+        elif kernel_size == [1, 3, 3]:
+            padding = (0, 1, 1)
+        else:
+            padding = 1
+            warnings.warn(
+                "kernel is neither 3, (3,3,3) or (1,3,3). This scenario has not been correctly implemented yet, but using padding = 1"
+            )
+
+        self.conv1 = nn.Conv3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias,
+        )
+        self.conv2 = nn.Conv3d(
+            out_channels,
+            out_channels,
+            kernel_size,
+            stride=1,
+            padding=padding,
+            bias=bias,
+        )
+        self.act = Activation()
+
         self.norm1 = Norm(out_channels, affine=True)
-        self.act1 = Activation()
-        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
         self.norm2 = Norm(out_channels, affine=True)
-        self.act2 = Activation()
 
     def forward(self, x):
         x = self.conv1(x)
         x = self.norm1(x)
-        x = self.act1(x)
-        
+        x = self.act(x)
+
         x = self.conv2(x)
         x = self.norm2(x)
-        x = self.act2(x)
+        x = self.act(x)
         return x
 
+
 class Up(nn.Module):
+    """
+    A helper Module that performs 2 convolutions, 1 UpConvolution and a uses a skip connection.
+    A PReLU activation and optionally a BatchNorm or InstanceNorm follows each convolution.
+    """
+
     def __init__(
         self,
         in_channels,
         out_channels,
-        stride,
+        kernel_size,
+        upsample_kernel_size,
         Norm=nn.InstanceNorm3d,
     ):
         super(Up, self).__init__()
@@ -162,16 +276,16 @@ class Up(nn.Module):
         self.transpconv = nn.ConvTranspose3d(
             in_channels,
             out_channels,
-            kernel_size=2,
-            stride=stride,
+            kernel_size=upsample_kernel_size,
+            stride=upsample_kernel_size,
             bias=False,
         )
         self.doubleconv = DoubleConv(
-            out_channels * 2, out_channels, stride=1, Norm=Norm
+            out_channels * 2, out_channels, kernel_size, stride=1, Norm=Norm
         )
 
-    def forward(self, x, skip):
+    def forward(self, x, x_skip):
         x = self.transpconv(x)
-        x = torch.cat((x, skip), dim=1)  # Concatenate skip connection with upsampled output
+        x = torch.cat((x_skip, x), dim=1)
         x = self.doubleconv(x)
         return x

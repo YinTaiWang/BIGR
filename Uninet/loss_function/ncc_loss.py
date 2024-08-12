@@ -9,6 +9,7 @@ torch.backends.cudnn.benchmark = False
 # class NCC(nn.Module):
 #     """
 #     Local (over window) normalized cross correlation loss.
+#     Copied from the source code of VoxelMorph
 #     """
 
 #     def __init__(self, win=None):
@@ -76,6 +77,8 @@ torch.backends.cudnn.benchmark = False
 class NCC(nn.Module):
     '''
     Calculate local normalized cross-correlation coefficient between two images. 
+    Copied from:
+    https://github.com/vincentme/GroupRegNet/blob/master/model/loss.py
 
     Parameters
     ----------
@@ -102,8 +105,8 @@ class NCC(nn.Module):
         '''
         Parameters
         ----------
-        I and J : (n, 1, h, w) or (n, 1, d, h, w)
-            Torch tensor of same shape. The number of image in the first dimension can be different, in which broadcasting will be used. 
+        I and J : (1, c, d, h, w)
+            Torch tensor of same shape. The number of image in the channel (c) can be different, in which broadcasting will be used. 
         windows_size : int
             Side length of the square window to calculate the local NCC. 
             
@@ -112,7 +115,7 @@ class NCC(nn.Module):
         NCC : scalar
             Average local normalized cross-correlation coefficient. 
         '''
-        I = I.permute(1,0,2,3,4)
+        I = I.permute(1,0,2,3,4) # change to (c, 1, d, h, w)
         J = J.permute(1,0,2,3,4)
         
         try:

@@ -8,6 +8,7 @@ import logging
 # class SpatialTransformer(nn.Module):
 #     """
 #     N-D Spatial Transformer
+#     Copied from the source code of VoxelMorph
 #     """
 
 #     def __init__(self, size, mode='bilinear'):
@@ -59,7 +60,10 @@ import logging
 ## GROUPREGNET ST
 class SpatialTransformer(nn.Module):
     # 2D or 3d spatial transformer network to calculate the warped moving image
-    
+    '''
+    Copied from:
+    https://github.com/vincentme/GroupRegNet/blob/master/model/regnet.py
+    '''
     
     def __init__(self, dim):
         super().__init__()
