@@ -1,14 +1,22 @@
 # Joint segmentation and groupwise registration network.
 
-## Usage
+## Table of Contents
+- [Introduction](#introduction)
+- [Dataset Format](#dataset-format)
+- [Preprocessing](#preprocess)
+- [Training](#training)
 
-### Dataset Format
+## Introduction
+The primary objective of this study is to develop an integrated model that performs joint segmentation and groupwise registration simultaneously to efficiently process DCE-MRI scans. We propose utilizing a SEDD architecture for multi-task learning that integrates these tasks at the architectural level, coupled with a novel loss function that facilitates joint learning during algorithm optimization. By implementing this unified model, we aim to streamline operational workflows while simultaneously enhancing the model efficiency and accuracy. To the best of our knowledge, this is the first attempt to integrate joint segmentation and groupwise registration into one single network framework.
 
-#### Supported File Formats
+
+## Dataset Format
+
+### Supported File Formats
 
 Currently, only SimpleITKIO: `.nii.gz` is supported.
 
-#### Dataset Folder Structure
+### Dataset Folder Structure
 
 The folder setup should be similar to `nnUNet`:
 
@@ -27,12 +35,11 @@ root/raw_data/
 ├── ...
 ```
 
-Each file name should follow the format `Task_XXX_YYYY`, where `XXX` is the task ID and `YYYY` is the 4-digit modality/channel identifier. If only one modality/channel is available, it should still be named using the format `_0000`.
+All files in the folder must be named using the format `Task_XXX_YYYY`. Here, `XXX` is the patient ID, and `YYYY` is a 4-digit modality or channel identifier. If there is only one modality or channel, use `_0000`.
 
-For each ID, it is assumed that there is only one label available. Therefore, the file name in `labelsTr` should use the same format, with `_YYYY` indicating the modality/channel from which the label was created. 
+Labels for segmentation are stored in the labelsTr folder and should follow the same naming format as the image files. The label file names include the _YYYY suffix to indicate the modality or channel used for creating the label. For example, if you create a label for patient 001 using modality 0001, the file should be named `Task_001_0001`. Similarly, for patient 002 using modality 0002, the file should be named `Task_002_0002`.
 
-For example, if you create labels (segmentations) using specific modality/channel images for IDs `001` and `002`, then the label file names in the `labelsTr` folder should correspond to those specific modality/channel images.
-
+Currently, only training data setup is required. There is no need for `ImagesTs` and `labelTs` folders as there is no testing data preparation code at this stage.
 
 ```
 root/raw_data/Task003_Liver/
@@ -46,25 +53,15 @@ root/raw_data/Task003_Liver/
 │   ├── BLT_002_0002.nii.gz
 │   ├── BLT_002_0003.nii.gz
 │   ├── ...
-├── imagesTs
-│   ├── BLT_485_0000.nii.gz
-│   ├── BLT_485_0001.nii.gz
-│   ├── BLT_485_0002.nii.gz
-│   ├── BLT_485_0003.nii.gz
-│   ├── BLT_486_0000.nii.gz
-│   ├── BLT_486_0001.nii.gz
-│   ├── BLT_486_0002.nii.gz
-│   ├── BLT_486_0003.nii.gz
-│   ├── ...
 └── labelsTr
     ├── BLT_001_0001.nii.gz # label was created using image "imagesTr/BLT_001_0001.nii.gz"
     ├── BLT_002_0003.nii.gz # label was created using image "imagesTr/BLT_002_0003.nii.gz"
     ├── ...
 ```
 
-### Preprocess
+## Preprocess
 
-To preprocess the dataset, run the following Python script:
+The preprocessing steps are performed independently prior to training. To preprocess the dataset, run the following Python script:
 
 ```
 python ./preprocess/RUN.py -root ROOT_DIRECTORY -t TASK_ID --bias_correction --rigid_transformation
@@ -75,110 +72,23 @@ python ./preprocess/RUN.py -root ROOT_DIRECTORY -t TASK_ID --bias_correction --r
 - `--bias_correction`: (Optional) Apply bias correction.
 - `--rigid_transformation`: (Optional) Apply rigid transformation.
 
-The script will generate `dataset.json` and `dataset_properties.pkl` in the `raw_data` folder. The preprocessed images and segmentations will be in the `preprocessed` folder.
+The script will generate `dataset.json` and `dataset_properties.pkl` in the `raw_data` folder. `plans.json` along with all preprocessed images and segmentations will be stored in the `preprocessed` folder.
 
-### Training
+## Training
 
-To run the training, run the following Python script:
+To initiate training, you can choose between two Python scripts depending on your specific requirements:
+
+- For single segmentation tasks using a 3D model, execute:
 
 ```
-python ./SegNet.py -root ROOT_DIRECTORY -t TASK_ID -f FOLD # 3D model
+python ./SegNet.py -root ROOT_DIRECTORY -t TASK_ID -f FOLD
+```
+This script employs the DynUnet model and processes single-image inputs.
+
+- For joint segmentation and groupwise registration using a 4D model, execute:
+```
 python ./UniNet.py -root ROOT_DIRECTORY -t TASK_ID -f FOLD # 4D model
 ```
+This script utilizes the DynUnet_uni model and handles multi-channel image inputs.
 
-The results would be in the 'results' folder.
-=======
-# JointSegmentationandRegistration
-
-
-
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://gitlab.com/radiology/radiomics/jointsegmentationandregistration.git
-git branch -M main
-git push -uf origin main
-```
-
-## Integrate with your tools
-
-- [ ] [Set up project integrations](https://gitlab.com/radiology/radiomics/jointsegmentationandregistration/-/settings/integrations)
-
-## Collaborate with your team
-
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
->>>>>>> 189a75d6691f5847d3f177cbe290c8e8088c08f7
+In both cases, ensure to replace `ROOT_DIRECTORY` with the path to your dataset, `TASK_ID` with the task identifier, and `FOLD` with the specific fold number for cross-validation. The results from either script will be stored in the `results` folder.
