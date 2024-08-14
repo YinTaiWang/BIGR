@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Joint segmentation and groupwise registration network.
 
 ## Usage
