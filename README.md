@@ -87,7 +87,7 @@ This script employs the DynUnet model and processes single-image inputs.
 
 - For joint segmentation and groupwise registration using a 4D model, execute:
 ```
-python ./UniNet.py -root ROOT_DIRECTORY -t TASK_ID -f FOLD # 4D model
+python ./UniNet.py -root ROOT_DIRECTORY -t TASK_ID -f FOLD
 ```
 This script utilizes the DynUnet_uni model and handles multi-channel image inputs.
 
